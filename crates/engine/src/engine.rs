@@ -250,9 +250,13 @@ fn write_unheld<G>(
 where
     G: std::ops::Deref<Target = Arc<dyn Projection + Send + Sync>>,
 {
+    let Checked {
+        revision,
+        plan,
+        mut unheld,
+    } = checked;
     let reusable = encoder.reusable_encoding();
-    let mut unheld = checked.unheld;
-    if reusable != checked.plan {
+    if reusable != plan {
         unheld.fill(true);
     }
     let (fresh, held): (Vec<usize>, Vec<usize>) = (0..wanted.len()).partition(|&at| unheld[at]);
@@ -265,7 +269,7 @@ where
         index().delete(&emptied)?;
     }
     let (supplied, to_embed) = kept.split(
-        &encoder.revision(),
+        &revision,
         reusable.as_deref(),
         fresh.iter().map(|&at| (at, passages[at])),
     );
@@ -279,24 +283,27 @@ where
     if to_embed.is_empty() {
         return Ok(Vec::new());
     }
-    let first = write_encoded(&index, encoder, wanted, passages, &to_embed)?;
+    let first = write_encoded(&index, encoder, &revision, wanted, passages, &to_embed)?;
     let encoding = first.as_ref().map(|pass| pass.encoding.as_str());
     let moved = !(held.is_empty() && supplied.is_empty()) && encoding != reusable.as_deref();
     let mut embedded: Vec<Embedded> = first.into_iter().collect();
     if moved {
         let every: Vec<usize> = (0..wanted.len()).collect();
-        embedded.extend(write_encoded(&index, encoder, wanted, passages, &every)?);
+        embedded.extend(write_encoded(
+            &index, encoder, &revision, wanted, passages, &every,
+        )?);
     }
     Ok(embedded)
 }
 
 /// Embeds every span of the topics of `wanted` at these positions in one
 /// pass, writes them in place of whatever the index held for those topics,
-/// recording the plan that produced them, and returns what it embedded:
-/// `None` when no plan can be shown to have.
+/// recording the plan that produced them, and returns what it embedded, as
+/// of `revision`, the encoder's: `None` when no plan can be shown to have.
 fn write_encoded<G>(
     index: &impl Fn() -> G,
     encoder: &mut impl PassageEncoder,
+    revision: &str,
     wanted: &[(TopicId, &[SpanSource<'_>])],
     passages: &[&[Passage<'_>]],
     at: &[usize],
@@ -313,7 +320,7 @@ where
     );
     index().replace(&documents, encoding.as_deref())?;
     Ok(Embedded::of(
-        encoder.revision(),
+        revision.to_string(),
         encoding.as_deref(),
         passages,
         &embeddings,
