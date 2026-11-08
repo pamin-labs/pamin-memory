@@ -32,7 +32,7 @@ impl<'a> Passage<'a> {
 
     /// The SHA-256 of the text, so the same text finds its vector whichever
     /// topic holds it. Taken on first use: a span the index already holds is
-    /// never looked up or kept.
+    /// not hashed unless a pass that moves the plan embeds it again.
     pub(crate) fn digest(&self) -> [u8; 32] {
         use sha2::Digest as _;
         *self
