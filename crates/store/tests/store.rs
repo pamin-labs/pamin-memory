@@ -96,6 +96,7 @@ async fn the_ledger_holds_its_promises() {
     a_version_is_numbered_and_read_from_its_own_key(&database, &workspace).await;
     a_span_vector_is_kept_once_and_for_its_project_alone(&database).await;
     a_scoped_transaction_reaches_only_its_project(&database).await;
+    the_tables_owner_sees_nothing_outside_a_scoped_transaction(&database).await;
     purging_a_project_leaves_none_of_its_rows(&database).await;
 
     drop(database);
@@ -219,16 +220,7 @@ async fn a_span_vector_is_kept_once_and_for_its_project_alone(database: &Databas
 /// nothing at all as the guarded role with no project named. Late in the run,
 /// so the checks above have filled several projects.
 async fn a_scoped_transaction_reaches_only_its_project(database: &Database) {
-    let guarded: Vec<(String,)> = sqlx::query_as(
-        "SELECT relname::text FROM pg_class
-          WHERE relnamespace = current_schema()::regnamespace
-            AND relrowsecurity AND relforcerowsecurity
-          ORDER BY relname",
-    )
-    .fetch_all(database.pool())
-    .await
-    .expect("list the guarded tables");
-    let guarded: Vec<String> = guarded.into_iter().map(|(table,)| table).collect();
+    let guarded = guarded_tables(database).await;
     assert_eq!(
         guarded,
         [
@@ -315,10 +307,42 @@ async fn a_scoped_transaction_reaches_only_its_project(database: &Database) {
         .execute(&mut *connection)
         .await
         .expect("roll back");
+}
 
-    // Hosted, the connection owns the tables and is no superuser. Played here
-    // by a role made owner of every guarded table inside a transaction that
-    // is rolled back.
+/// The tables row-level security guards, by name, having checked it is
+/// forced on each: listed by enabled alone, so an unforced one fails here
+/// rather than dropping out of the list.
+async fn guarded_tables(database: &Database) -> Vec<String> {
+    let tables: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT relname::text, relforcerowsecurity FROM pg_class
+          WHERE relnamespace = current_schema()::regnamespace AND relrowsecurity
+          ORDER BY relname",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("list the guarded tables");
+    let unforced: Vec<&str> = tables
+        .iter()
+        .filter(|(_, forced)| !forced)
+        .map(|(table, _)| table.as_str())
+        .collect();
+    assert!(
+        unforced.is_empty(),
+        "row-level security is forced on every guarded table: {unforced:?}"
+    );
+    tables.into_iter().map(|(table, _)| table).collect()
+}
+
+/// Outside a scoped transaction the tables' owner sees no guarded row.
+///
+/// Hosted, the connection owns the tables and is no superuser, so without the
+/// force it would skip row-level security and reach every project. Played
+/// here by a role made owner of every guarded table inside a transaction that
+/// is rolled back: it reads, updates and inserts nothing.
+async fn the_tables_owner_sees_nothing_outside_a_scoped_transaction(database: &Database) {
+    let guarded = guarded_tables(database).await;
+    assert!(!guarded.is_empty(), "the premise: some table is guarded");
+    let mut connection = database.pool().acquire().await.expect("a connection");
     let mut setup =
         vec!["BEGIN; CREATE ROLE owner_probe NOLOGIN NOSUPERUSER NOBYPASSRLS".to_string()];
     setup.extend(
@@ -360,16 +384,14 @@ async fn a_scoped_transaction_reaches_only_its_project(database: &Database) {
         let inserted = sqlx::query(AssertSqlSafe(format!("INSERT INTO {table} DEFAULT VALUES")))
             .execute(&mut *connection)
             .await;
-        // insufficient_privilege, which a row-level security refusal is but
-        // so is any other denied permission, so the message says which.
+        // insufficient_privilege: the role owns the table, so row-level
+        // security is the only denial these tables can raise today: none has
+        // a trigger, sequence or default that reaches another object.
         let refused = inserted
             .as_ref()
             .err()
             .and_then(|error| error.as_database_error())
-            .is_some_and(|error| {
-                error.code().as_deref() == Some("42501")
-                    && error.message().contains("row-level security")
-            });
+            .is_some_and(|error| error.code().as_deref() == Some("42501"));
         assert!(
             refused,
             "the owner's insert into {table} is refused by row-level security: {inserted:?}"

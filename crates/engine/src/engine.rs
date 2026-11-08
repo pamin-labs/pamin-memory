@@ -1027,9 +1027,15 @@ impl Engine {
         .await
     }
 
+    /// Left in an index directory from when a rebuild sets the old index aside
+    /// until it finishes indexing, and in one an open created for a project
+    /// whose index was missing. Public so a test can leave one behind.
+    #[doc(hidden)]
+    pub const UNFINISHED_REBUILD: &str = ".rebuilding";
+
     /// Whether a rebuild in this index directory started and never finished.
     pub fn rebuild_unfinished(dir: &std::path::Path) -> bool {
-        dir.join(UNFINISHED_REBUILD).exists()
+        dir.join(Self::UNFINISHED_REBUILD).exists()
     }
 
     async fn assemble(
@@ -1073,8 +1079,8 @@ impl Engine {
         // the index is missing or a rebuild stopped part way. Decided before
         // the open, which creates the directory, and only with the directory
         // in hand: a reshape running here may have it aside for a moment. A
-        // workspace on the shared layout is not, since only `reindex` moves it
-        // off that.
+        // workspace on the shared layout is not, since only the `reindex`
+        // command moves it off that.
         let unfinished = exclusive.is_some()
             && off_the_runtime(|| {
                 memory_index::Reshape::recover(&dir)?;
@@ -1109,7 +1115,7 @@ impl Engine {
             // the same way, so that whichever open comes next rebuilds it.
             if discard || (unfinished && !std::fs::exists(&dir)?) {
                 std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join(UNFINISHED_REBUILD), b"")?;
+                std::fs::write(dir.join(Self::UNFINISHED_REBUILD), b"")?;
             }
 
             let index = ProjectionIndex::open_as(
@@ -3084,7 +3090,7 @@ impl Engine {
 
         // The index is whole either way: a marker left behind costs the next
         // open a rebuild it did not need, which is no reason to fail this one.
-        let marker = self.dir.join(UNFINISHED_REBUILD);
+        let marker = self.dir.join(Self::UNFINISHED_REBUILD);
         if let Err(error) = tokio::fs::remove_file(&marker).await {
             tracing::warn!(
                 %error,
@@ -3187,11 +3193,6 @@ pub struct Recorded {
     /// Absent when the filter held the content in the evidence layer.
     pub state: Option<TopicState>,
 }
-
-/// Left in an index directory from when a rebuild sets the old index aside
-/// until it finishes indexing, and in one an open created for a project whose
-/// index was missing.
-const UNFINISHED_REBUILD: &str = ".rebuilding";
 
 /// Whether an open rebuilds its index from the ledger.
 #[derive(Clone, Copy, PartialEq, Eq)]

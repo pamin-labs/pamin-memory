@@ -1,8 +1,8 @@
 //! What recording a section of a file leaves in the ledger.
 //!
-//! Ignored by default: it provisions PostgreSQL. Only the reindex test loads a
-//! model -- nothing else here drains the cascade -- so the rest run in
-//! seconds. Run with `cargo test -p memory-engine --test ingest -- --ignored`.
+//! Ignored by default: it provisions PostgreSQL. Only the reindex test and the
+//! rebuild-on-open test, in its lost-index case, load a model -- nothing else
+//! here drains the cascade -- so the rest run in seconds. Run with `cargo test -p memory-engine --test ingest -- --ignored`.
 //!
 //! A section differs from a manual memory in three ways, each of which is a
 //! cost or a leak if it goes wrong and none of which a search would show: an
@@ -25,8 +25,7 @@ fn settings() -> memory_engine::Settings {
         store: memory_store::StoreSettings {
             jit: support::eval::switch("PAMIN_MEMORY_EVAL_JIT").unwrap_or_default(),
             postgres_dir: support::eval::path("PAMIN_MEMORY_EVAL_POSTGRES_DIR"),
-            database_url: None,
-            database_connections: None,
+            external: None,
         },
         ..memory_engine::Settings::default()
     }
@@ -400,12 +399,15 @@ async fn a_reindex_keeps_sections_out_of_the_name_index() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provisions postgres"]
 async fn a_missing_or_unfinished_index_is_rebuilt_on_the_next_open() {
-    let scratch = tempfile::tempdir().expect("temp workspace");
-    let workspace = Workspace::at(scratch.path());
-    let database = Database::open(&workspace, Connections::PerCommand, &settings().store)
+    let (engine, workspace, name, _scratch) = engine_in().await;
+    engine
+        .remember("rollback_plan", TEXT, Validity::ALWAYS)
         .await
-        .expect("open the database");
-    let name = format!("ingest-{}", uuid::Uuid::now_v7());
+        .expect("manual write");
+    let database = engine.database.clone();
+    let dir = workspace.index_dir(engine.project);
+    drop(engine);
+
     let open = async || {
         Engine::open(
             &workspace,
@@ -417,16 +419,6 @@ async fn a_missing_or_unfinished_index_is_rebuilt_on_the_next_open() {
         .await
         .expect("open the engine")
     };
-    open()
-        .await
-        .remember("rollback_plan", TEXT, Validity::ALWAYS)
-        .await
-        .expect("manual write");
-
-    let project = repository::ensure_project(database.pool(), &name)
-        .await
-        .expect("the project");
-    let dir = workspace.index_dir(project.id);
     let models = memory_engine::Models::new(settings());
     let attached = async || {
         Engine::attached(

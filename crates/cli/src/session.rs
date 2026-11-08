@@ -88,7 +88,7 @@ impl Session {
         let database = Database::open(workspace, Connections::Resident, &settings.store).await;
         // The store names no variable; an external server is the one this
         // process was given in the environment.
-        let database = match &settings.store.database_url {
+        let database = match &settings.store.external {
             Some(_) => database.with_context(|| {
                 format!("opening the PostgreSQL server named by {DATABASE_URL}")
             })?,

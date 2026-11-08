@@ -187,14 +187,16 @@ pub struct ServerArgs {
     )]
     pub postgres_dir: Option<PathBuf>,
 
-    /// The most connections the server opens to the PostgreSQL server named
-    /// by `PAMIN_MEMORY_DATABASE_URL`, which it needs. Default: the server's
-    /// own pool size.
+    // Built from the constant, not a doc comment, so the variable is named once.
     #[arg(
         long,
         value_name = "N",
         global = true,
-        help_heading = "Server settings"
+        help_heading = "Server settings",
+        help = format!(
+            "The most connections the server opens to the PostgreSQL server named \
+             by `{DATABASE_URL}`, which it needs. Default: the server's own pool size"
+        )
     )]
     pub database_connections: Option<NonZeroU32>,
 

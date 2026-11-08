@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use memory_core::{VectorIndex, Workspace};
 
+use crate::settings::DATABASE_URL;
 use crate::{client, output, protocol, settings};
 
 #[derive(Parser)]
@@ -120,10 +121,13 @@ pub enum Command {
     /// Stop the local database server, and the resident server if one is up.
     Stop,
 
-    /// Apply this release's schema migrations to the external database named
-    /// by `PAMIN_MEMORY_DATABASE_URL`, once per deploy, before starting the
-    /// servers that need them. Servers on that database never migrate it
-    /// themselves; a workspace's own cluster migrates when it opens.
+    // Built from the constant, not a doc comment, so the variable is named once.
+    #[command(about = format!(
+        "Apply this release's schema migrations to the external database named \
+         by `{DATABASE_URL}`, once per deploy, before starting the servers that need \
+         them. Servers on that database never migrate it themselves; a workspace's \
+         own cluster migrates when it opens"
+    ))]
     Migrate,
 
     /// Hold the database, the index and the model, and answer commands.
@@ -330,10 +334,9 @@ fn refuse_removed_settings() -> Result<()> {
 }
 
 /// The settings [`refuse_removed_settings`] turns away, and what became of
-/// each. Since only `PAMIN_MEMORY_HOME`, `PAMIN_MEMORY_PROJECT`, `PAMIN_MEMORY_VECTOR_INDEX`,
-/// `PAMIN_MEMORY_DEVICE`, `PAMIN_MEMORY_MODELS_DIR`, `PAMIN_MEMORY_LOG` and the server's
-/// `PAMIN_MEMORY_DATABASE_URL` are read, every other setting that was a variable is a
-/// flag, a `config.toml` key, or gone.
+/// each. Every setting that was a variable and is not among those still read
+/// (`READ` in the tests, and `docs/cli.md`) is a flag, a `config.toml` key,
+/// or gone.
 const REMOVED: &[(&str, &str)] = &[
     (
         "PAMIN_MEMORY_NO_SERVER",
@@ -684,6 +687,25 @@ mod tests {
         let mut expected: Vec<String> = READ.iter().map(|name| name.to_string()).collect();
         expected.sort();
         assert_eq!(read, expected, "the variables the binary reads changed");
+
+        // The page's own list of what is read, up to the `;` that ends it,
+        // however the paragraph is wrapped.
+        let prose = documented.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (_, list) = prose
+            .split_once("The only variables `pamin-memory` reads are")
+            .expect("docs/cli.md lists the variables read");
+        let (list, _) = list.split_once(';').expect("the list ends with `;`");
+        let mut listed: Vec<String> = list
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed, expected,
+            "docs/cli.md's list of variables read is not READ"
+        );
 
         for name in READ {
             assert!(
