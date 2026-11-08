@@ -18,6 +18,10 @@ use crate::error::Result;
 use crate::workspace::{LocalServer, StartedWith, Workspace};
 pub use memory_core::settings::installation_missing;
 
+/// The PostgreSQL release the embedded cluster runs, exactly. Public so a
+/// caller embedding its own throwaway cluster runs the same one.
+pub const POSTGRES_VERSION: &str = "17.6.0";
+
 /// The database name created inside the embedded cluster.
 const DATABASE: &str = "pamin_memory";
 
@@ -643,7 +647,8 @@ async fn start_server(workspace: &Workspace, store: &StoreSettings) -> Result<Lo
     std::fs::create_dir_all(workspace.postgres_data_dir())?;
 
     let mut settings = Settings {
-        version: VersionReq::parse("=17.6.0").expect("valid version requirement"),
+        version: VersionReq::parse(&format!("={POSTGRES_VERSION}"))
+            .expect("valid version requirement"),
         trust_installation_dir: supplied.is_some(),
         installation_dir: supplied.unwrap_or_else(|| workspace.postgres_install_dir()),
         data_dir: workspace.postgres_data_dir(),

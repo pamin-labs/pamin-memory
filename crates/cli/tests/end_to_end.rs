@@ -14,6 +14,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use memory_client::cli::HOME_ENV;
 use serde_json::Value;
 
 struct Cli {
@@ -42,7 +43,7 @@ impl Cli {
     fn run(&self, args: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(args)
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .output()
             .expect("running pamin-memory");
 
@@ -86,7 +87,7 @@ impl Cli {
         let child = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(["serve"])
             .args(flags)
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .env("PAMIN_MEMORY_LOG", filter)
             .stdout(log.try_clone().expect("a second handle on the log"))
             .stderr(log)
@@ -111,7 +112,7 @@ impl Cli {
     fn fails(&self, args: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(args)
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .output()
             .expect("running pamin-memory");
         assert!(!output.status.success(), "expected {args:?} to fail");
@@ -124,7 +125,7 @@ impl Drop for Cli {
         // Leaves no server behind for the next test to collide with.
         let _ = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(["stop"])
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .output();
     }
 }
@@ -1161,7 +1162,7 @@ fn a_removed_setting_is_refused_rather_than_ignored() {
         for value in values {
             let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
                 .args(["read", "deploy"])
-                .env("PAMIN_MEMORY_HOME", home.path())
+                .env(HOME_ENV, home.path())
                 .env(name, value)
                 .output()
                 .expect("running pamin-memory");
@@ -1205,7 +1206,7 @@ fn a_walk_deeper_than_the_graph_channel_goes_is_refused() {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(args)
-            .env("PAMIN_MEMORY_HOME", home.path())
+            .env(HOME_ENV, home.path())
             .output()
             .expect("running pamin-memory");
 
@@ -2290,7 +2291,7 @@ fn an_import_records_the_whole_file_or_none_of_it() {
     let refused = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
         .args(["import", "--from"])
         .arg(&broken)
-        .env("PAMIN_MEMORY_HOME", cli.home())
+        .env(HOME_ENV, cli.home())
         .output()
         .expect("running import");
     assert!(
@@ -2515,7 +2516,7 @@ fn an_ingested_file_is_found_by_section_and_re_ingested_by_change() {
     let relative = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
         .args(["ingest", "--no-sync", "docs", "--json"])
         .current_dir(tree.path())
-        .env("PAMIN_MEMORY_HOME", cli.home())
+        .env(HOME_ENV, cli.home())
         .output()
         .expect("running ingest");
     assert!(relative.status.success(), "{relative:?}");

@@ -20,15 +20,28 @@ use serde::de::DeserializeOwned;
 use crate::protocol::{self, Call, Request};
 use crate::{client, settings};
 
+/// The names of the tools this module serves: what an MCP client calls, and
+/// what whoever hosts memory meters each call by.
+pub mod tool {
+    pub const SEARCH: &str = "memory_search";
+    pub const READ: &str = "memory_read";
+    pub const GREP: &str = "memory_grep";
+    pub const NEIGHBORS: &str = "memory_neighbors";
+    pub const TOPICS: &str = "memory_topics";
+    pub const WRITE: &str = "memory_write";
+    pub const LINK: &str = "memory_link";
+    pub const UNLINK: &str = "memory_unlink";
+}
+
 /// The tools that only read the project.
 const READS: [&str; 5] = [
-    "memory_search",
-    "memory_read",
-    "memory_grep",
-    "memory_neighbors",
-    "memory_topics",
+    tool::SEARCH,
+    tool::READ,
+    tool::GREP,
+    tool::NEIGHBORS,
+    tool::TOPICS,
 ];
-const READ: Hints = Hints {
+const READ_ONLY: Hints = Hints {
     read_only: true,
     destructive: false,
     idempotent: true,
@@ -104,38 +117,38 @@ impl Module for Memory {
     }
 
     fn register(&self, ops: &mut Ops<Self>) {
-        ops.tool("memory_search", Feature::Core, |m, ctx, a| {
+        ops.tool(tool::SEARCH, Feature::Core, |m, ctx, a| {
             m.ask::<search::Results>(ctx, Call::Search(a))
         })
-        .tool("memory_read", Feature::Core, |m, ctx, a| {
+        .tool(tool::READ, Feature::Core, |m, ctx, a| {
             m.ask::<read::Read>(ctx, Call::Read(a))
         })
-        .tool("memory_grep", Feature::Core, |m, ctx, a| {
+        .tool(tool::GREP, Feature::Core, |m, ctx, a| {
             m.ask::<grep::Matches>(ctx, Call::Grep(a))
         })
-        .tool("memory_neighbors", Feature::Core, |m, ctx, a| {
+        .tool(tool::NEIGHBORS, Feature::Core, |m, ctx, a| {
             m.ask::<neighbors::Neighborhood>(ctx, Call::Neighbors(a))
         })
-        .tool("memory_topics", Feature::Core, |m, ctx, a| {
+        .tool(tool::TOPICS, Feature::Core, |m, ctx, a| {
             m.ask::<topics::Topics>(ctx, Call::Topics(a))
         })
-        .tool("memory_write", Feature::Core, |m, ctx, a| {
+        .tool(tool::WRITE, Feature::Core, |m, ctx, a| {
             m.ask::<write::Written>(ctx, Call::Write(a))
         })
-        .tool("memory_link", Feature::Core, |m, ctx, a| {
+        .tool(tool::LINK, Feature::Core, |m, ctx, a| {
             m.ask::<link::Linked>(ctx, Call::Link(a))
         })
-        .tool("memory_unlink", Feature::Core, |m, ctx, a| {
+        .tool(tool::UNLINK, Feature::Core, |m, ctx, a| {
             m.ask::<unlink::Unlinked>(ctx, Call::Unlink(a))
         });
-        for tool in READS {
-            ops.hints(tool, READ);
+        for name in READS {
+            ops.hints(name, READ_ONLY);
         }
         // Writing and linking add a version and keep the old one.
-        ops.hints("memory_write", ADD).hints("memory_link", ADD);
+        ops.hints(tool::WRITE, ADD).hints(tool::LINK, ADD);
         // Unlinking with `deleted` erases that a link ever held.
         ops.hints(
-            "memory_unlink",
+            tool::UNLINK,
             Hints {
                 destructive: true,
                 ..ADD

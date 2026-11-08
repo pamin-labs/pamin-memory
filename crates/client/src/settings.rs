@@ -41,6 +41,9 @@ pub const CONFIG: &str = "config.toml";
 /// `config.toml` key, and no client sends it.
 pub const DATABASE_URL: &str = "PAMIN_MEMORY_DATABASE_URL";
 
+/// The variable `--models-dir` is read from.
+pub const MODELS_DIR_ENV: &str = "PAMIN_MEMORY_MODELS_DIR";
+
 /// How many indexes stay open at once.
 ///
 /// An open index is not free and does not become free by being idle. It holds
@@ -206,7 +209,7 @@ pub struct ServerArgs {
     #[arg(
         long,
         value_name = "PATH",
-        env = "PAMIN_MEMORY_MODELS_DIR",
+        env = MODELS_DIR_ENV,
         global = true,
         help_heading = "Server settings"
     )]

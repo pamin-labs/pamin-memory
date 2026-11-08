@@ -15,6 +15,9 @@ use memory_core::{VectorIndex, Workspace};
 use crate::settings::DATABASE_URL;
 use crate::{client, output, protocol, settings};
 
+/// The variable `--home` is read from.
+pub const HOME_ENV: &str = "PAMIN_MEMORY_HOME";
+
 #[derive(Parser)]
 #[command(
     name = "pamin-memory",
@@ -24,7 +27,7 @@ use crate::{client, output, protocol, settings};
 )]
 pub struct Cli {
     /// Where pamin-memory keeps its database, indexes, and models.
-    #[arg(long, env = "PAMIN_MEMORY_HOME", global = true)]
+    #[arg(long, env = HOME_ENV, global = true)]
     pub home: Option<std::path::PathBuf>,
 
     /// The memory namespace to operate on.
@@ -606,11 +609,11 @@ mod tests {
     /// so is no flag or `config.toml` key.
     const READ: &[&str] = &[
         settings::DATABASE_URL,
-        "PAMIN_MEMORY_HOME",
+        HOME_ENV,
         "PAMIN_MEMORY_PROJECT",
         "PAMIN_MEMORY_VECTOR_INDEX",
         "PAMIN_MEMORY_DEVICE",
-        "PAMIN_MEMORY_MODELS_DIR",
+        settings::MODELS_DIR_ENV,
         "PAMIN_MEMORY_LOG",
     ];
 
