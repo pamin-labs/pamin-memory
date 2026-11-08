@@ -25,7 +25,7 @@ pub use descriptors::raise_open_file_limit;
 pub use embedding::{DIMENSIONS, Embedder, MODEL_ID, cached_revision};
 pub use error::{IndexError, Result};
 pub use half::{
-    Codes as VectorCodes, as_stored, from_bytes as vector_codes, to_bytes as vector_to_bytes,
+    Codes as VectorCodes, as_stored, from_bytes as vector_from_bytes, to_bytes as vector_to_bytes,
     widen as widen_vector,
 };
 pub use hub::cache_root as model_cache_root;

@@ -285,7 +285,7 @@ impl Engine {
             }
         };
         for row in rows {
-            let Some(codes) = memory_index::vector_codes(&row.vector) else {
+            let Some(codes) = memory_index::vector_from_bytes(&row.vector) else {
                 tracing::warn!(
                     encoding = row.encoding,
                     bytes = row.vector.len(),

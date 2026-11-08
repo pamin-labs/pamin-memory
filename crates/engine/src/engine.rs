@@ -5204,7 +5204,7 @@ mod tests {
                         let bytes = memory_index::vector_to_bytes(&vector);
                         (
                             digest,
-                            memory_index::vector_codes(&bytes).expect("a vector"),
+                            memory_index::vector_from_bytes(&bytes).expect("a vector"),
                         )
                     })
                     .collect(),
