@@ -146,8 +146,10 @@ fn migration(version: i64, description: &'static str, sql: &'static str) -> Migr
     // policies -- fails on any statement a policy applies to, rather than
     // matching no row and recording itself applied. A superuser, as a local
     // workspace's connection is, skips the policies either way, so only hosted
-    // shows it, and a migration that rewrites guarded rows has to run them per
-    // project as the guarded role instead.
+    // shows it. Running them as `pamin_memory_app` fails the same way, so a
+    // migration that rewrites guarded rows lifts the force around them instead:
+    // `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, the rewrite, then `FORCE`
+    // again, all inside the migration's transaction.
     //
     // `SET LOCAL`, inside the transaction `sqlx` applies each migration in
     // (none is `no_tx`, which the test below holds),
