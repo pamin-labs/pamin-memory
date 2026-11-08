@@ -126,9 +126,11 @@ async fn a_rebuild_from_kept_vectors_loads_no_model() {
     );
     drop(engine);
 
-    std::fs::remove_dir_all(workspace.index_dir(project.id)).expect("remove the index");
+    let dir = workspace.index_dir(project.id);
+    std::fs::remove_dir_all(&dir).expect("remove the index");
+    drop(open(&workspace, &name).await);
     assert!(
-        open(&workspace, &name).await.needs_rebuild(),
+        Engine::rebuild_unfinished(&dir),
         "the premise: the index is gone"
     );
     let (engine, rebuilt) = rebuilt(&workspace, &name).await;

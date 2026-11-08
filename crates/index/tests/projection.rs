@@ -918,8 +918,31 @@ fn a_rebuild_reuses_only_the_vectors_of_unchanged_text() {
         !lent.contains_key(&id(3)),
         "a topic the old index lacks is embedded"
     );
+
+    // A rebuild that stopped part way leaves that index aside and its partial
+    // output in `dir`: the next one lends from the whole index, not the part.
+    drop(previous);
+    let partial =
+        ProjectionIndex::open(&dir, &legacy, VectorIndex::default(), Access::ReadWrite, 0)
+            .expect("open");
+    partial
+        .upsert_batch(&[(id(3), "a topic the old index never held", stub().as_slice())])
+        .expect("write");
+    partial.flush().expect("flush");
+    drop(partial);
+    let previous = Previous::set_aside(&dir)
+        .expect("set aside")
+        .expect("the whole index still lends");
+    assert!(!dir.exists(), "the partial output is discarded");
+    let resumed = crate::lent(&previous, &wanted);
+    assert!(resumed.contains_key(&id(1)), "the whole index did not lend");
+    assert!(
+        !resumed.contains_key(&id(3)),
+        "lent from the partial output"
+    );
     previous.discard().expect("discard");
     assert!(!dir.with_extension("previous").exists());
+    assert!(!dir.with_extension("discarded").exists());
 
     // Built from content alone: its vectors are not what an index built now
     // computes, so it lends nothing and is discarded.

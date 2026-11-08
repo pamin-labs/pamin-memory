@@ -18,11 +18,11 @@ async fn an_external_server_is_used_and_never_started() {
     let hosted = Database::open(&host, Connections::PerCommand, &common::store())
         .await
         .expect("start the stand-in server");
-    let superuser = host
+    let record = host
         .read_server()
         .expect("read the host's record")
-        .expect("the host recorded its server")
-        .url();
+        .expect("the host recorded its server");
+    let superuser = record.url();
     let (server, _) = superuser.rsplit_once('/').expect("a database in the URL");
     let (_, address) = server.split_once('@').expect("credentials in the URL");
     let external = |role: &str, database: &str| StoreSettings {
@@ -33,17 +33,17 @@ async fn an_external_server_is_used_and_never_started() {
     };
 
     // A hosted login: it owns its databases and is bound by row-level
-    // security, with the guarded role made for it once.
+    // security, with the guarded role made for it once. And one with
+    // BYPASSRLS, as a managed server's administrator often is, given node's
+    // privileges so it can open and migrate the database node owns.
     for statement in [
         "CREATE ROLE node LOGIN PASSWORD 'node' NOSUPERUSER NOBYPASSRLS",
         "GRANT pamin_memory_app TO node WITH ADMIN OPTION",
         "CREATE DATABASE nodes OWNER node",
         "CREATE ROLE bypassing LOGIN PASSWORD 'bypassing' NOSUPERUSER BYPASSRLS",
+        "GRANT node TO bypassing",
     ] {
-        sqlx::query(statement)
-            .execute(hosted.pool())
-            .await
-            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        run(&hosted, statement).await;
     }
 
     let node = tempfile::tempdir().expect("node workspace");
@@ -131,31 +131,52 @@ async fn an_external_server_is_used_and_never_started() {
         .expect("open with a cap");
     assert_eq!(database.pool().options().get_max_connections(), 2);
 
-    // A login row-level security would not bind is refused, saying why, by a
-    // server and by a deploy migrating: one with BYPASSRLS, as a managed
-    // server's administrator often is, and a superuser.
-    for (refused, how) in [
-        (external("bypassing", "nodes"), "BYPASSRLS"),
+    // A hosted login and the guarded role skip nothing.
+    let skipping = |database: Database| async move {
+        database
+            .skipping_row_level_security()
+            .await
+            .expect("read the roles' attributes")
+    };
+    assert!(skipping(database).await.is_empty());
+
+    // A login row-level security would not bind is the operator's choice: a
+    // server and a deploy migrating both run, and it is named, for the warning.
+    // The one with BYPASSRLS, and a superuser.
+    for (login, role) in [
+        (external("bypassing", "nodes"), "bypassing"),
         (
             StoreSettings {
                 database_url: Some(DatabaseUrl(format!("{server}/nodes"))),
                 ..common::store()
             },
-            "a superuser",
+            record.username.as_str(),
         ),
     ] {
-        let error = Database::open(&node, Connections::PerCommand, &refused)
+        let database = Database::open(&node, Connections::PerCommand, &login)
             .await
-            .err()
-            .unwrap_or_else(|| panic!("a login with {how} is refused"));
-        assert!(error.to_string().contains("row-level security"), "{error}");
-        let url = refused.database_url.as_ref().expect("an external URL");
-        let error = Database::migrate(url)
+            .unwrap_or_else(|error| panic!("open as {role}: {error}"));
+        assert_eq!(skipping(database).await, [role]);
+        let url = login.database_url.as_ref().expect("an external URL");
+        Database::migrate(url)
             .await
-            .err()
-            .unwrap_or_else(|| panic!("migrating as a login with {how} is refused"));
-        assert!(error.to_string().contains("row-level security"), "{error}");
+            .unwrap_or_else(|error| panic!("migrate as {role}: {error}"));
     }
+
+    // So is a guarded role an operator made with BYPASSRLS.
+    run(&hosted, "ALTER ROLE pamin_memory_app BYPASSRLS").await;
+    let database = Database::open(&node, Connections::PerCommand, &settings)
+        .await
+        .expect("open with a guarded role that bypasses");
+    assert_eq!(skipping(database).await, ["pamin_memory_app"]);
+}
+
+/// Runs a statement on the stand-in server as its superuser.
+async fn run(hosted: &Database, statement: &'static str) {
+    sqlx::query(statement)
+        .execute(hosted.pool())
+        .await
+        .unwrap_or_else(|error| panic!("{statement}: {error}"));
 }
 
 /// The versions a refused open said were missing.

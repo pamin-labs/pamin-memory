@@ -1758,22 +1758,28 @@ pub struct Previous {
 impl Previous {
     /// Moves the index in `dir` aside and opens it to lend its vectors.
     ///
-    /// `None`, with the directory discarded, when there is no index or when
-    /// its vectors were computed some other way than an index built now would
-    /// compute them. A directory left aside by a rebuild that did not finish is
-    /// discarded first: what is in `dir` is then that rebuild's partial output
-    /// or its finished one, and the ledger reproduces either.
+    /// An index already aside is kept instead, with `dir` discarded: one is
+    /// left only by a rebuild that did not finish, which discards it once
+    /// it has indexed everything, so it is the whole index from before that
+    /// rebuild and `dir` that rebuild's partial output. Lending from `dir`
+    /// would embed again everything the partial output had not reached.
+    ///
+    /// `None`, with both discarded, when there is no index or when its vectors
+    /// were computed some other way than an index built now would compute them.
     pub fn set_aside(dir: &Path) -> Result<Option<Self>> {
         let aside = dir.with_extension("previous");
-        ProjectionIndex::discard(&aside)?;
+        if std::fs::exists(&aside)? {
+            ProjectionIndex::discard(dir)?;
+        } else if std::fs::exists(dir)? {
+            std::fs::rename(dir, &aside)?;
+        }
         let current = Marker::current(VectorIndex::default(), Grain::default());
-        let Some(recorded) = Marker::read(dir)?.filter(|recorded| {
+        let Some(recorded) = Marker::read(&aside)?.filter(|recorded| {
             recorded.matches(&current) && Grain::parse(&recorded.grain).is_some()
         }) else {
-            ProjectionIndex::discard(dir)?;
+            ProjectionIndex::discard(&aside)?;
             return Ok(None);
         };
-        std::fs::rename(dir, &aside)?;
         // The collection exists, so the vector index passed here only fills a
         // schema the engine does not read.
         let mut index = ProjectionIndex::open_with_dimensions(
@@ -1961,10 +1967,16 @@ impl Previous {
     }
 
     /// Deletes the set-aside index, once the rebuild no longer needs it.
+    ///
+    /// Renamed first, so a stop part way through the delete never leaves part
+    /// of an index under the name [`set_aside`](Self::set_aside) keeps.
     pub fn discard(self) -> Result<()> {
         let Self { index, dir, .. } = self;
         drop(index);
-        ProjectionIndex::discard(&dir)
+        let gone = dir.with_extension("discarded");
+        ProjectionIndex::discard(&gone)?;
+        std::fs::rename(&dir, &gone)?;
+        ProjectionIndex::discard(&gone)
     }
 }
 

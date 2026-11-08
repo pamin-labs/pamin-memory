@@ -395,10 +395,11 @@ async fn a_reindex_keeps_sections_out_of_the_name_index() {
 /// A rebuild marks its index unfinished before it opens the empty one, so a
 /// rebuild stopped right after setting the old index aside, before it indexed
 /// anything, is rebuilt on the next open rather than taken for a whole index
-/// that answers nothing.
+/// that answers nothing. An open that finds the index missing marks the one it
+/// creates the same way.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provisions postgres"]
-async fn a_rebuild_stopped_after_setting_the_index_aside_is_unfinished() {
+async fn a_missing_or_unfinished_index_is_rebuilt_on_the_next_open() {
     let scratch = tempfile::tempdir().expect("temp workspace");
     let workspace = Workspace::at(scratch.path());
     let database = Database::open(&workspace, Connections::PerCommand, &settings().store)
@@ -422,11 +423,29 @@ async fn a_rebuild_stopped_after_setting_the_index_aside_is_unfinished() {
         .await
         .expect("manual write");
 
+    let project = repository::ensure_project(database.pool(), &name)
+        .await
+        .expect("the project");
+    let dir = workspace.index_dir(project.id);
+    let models = memory_engine::Models::new(settings());
+    let attached = async || {
+        Engine::attached(
+            database.clone(),
+            &models,
+            &workspace,
+            &name,
+            VectorIndex::default(),
+            Access::ReadWrite,
+        )
+        .await
+        .expect("open, rebuilding if unfinished")
+    };
+
     // Stopped before `reindex`: the old index is aside and the new one empty.
     drop(
         Engine::rebuilding_attached(
-            database,
-            &memory_engine::Models::new(settings()),
+            database.clone(),
+            &models,
             &workspace,
             &name,
             VectorIndex::default(),
@@ -434,10 +453,29 @@ async fn a_rebuild_stopped_after_setting_the_index_aside_is_unfinished() {
         .await
         .expect("start a rebuild"),
     );
-
+    drop(open().await);
     assert!(
-        open().await.needs_rebuild(),
+        Engine::rebuild_unfinished(&dir),
         "a rebuild stopped after setting the index aside was taken for finished"
+    );
+    drop(attached().await);
+    assert!(
+        !Engine::rebuild_unfinished(&dir),
+        "an open left an unfinished index unrebuilt"
+    );
+
+    // A missing index: an open that does not rebuild leaves the one it
+    // creates marked, and the next one that does rebuilds it.
+    std::fs::remove_dir_all(&dir).expect("lose the index");
+    drop(open().await);
+    assert!(
+        Engine::rebuild_unfinished(&dir),
+        "a missing index was taken for empty"
+    );
+    drop(attached().await);
+    assert!(
+        !Engine::rebuild_unfinished(&dir),
+        "an open left an unfinished index unrebuilt"
     );
 }
 
