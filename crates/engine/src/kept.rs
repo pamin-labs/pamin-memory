@@ -108,35 +108,36 @@ impl Kept {
     /// topic to embed. A loaded model then decides instead, by its own
     /// revision and plan, which are what its vectors will be of.
     ///
+    /// `load` takes the model's lock, so call this before taking the index's:
+    /// the model before the index, as every caller takes them, or a search
+    /// holding the model and wanting the index would deadlock against it.
+    ///
     /// ponytail: span_vectors is per project, not per node, so the widest
     /// plan can be another node's; nodes on one kind of hardware run one plan
     /// in practice. Checking it would mean loading the model.
     pub(crate) fn split_for_rebuild<'t, T, I, M, E>(
         &self,
-        topics: impl Fn() -> I,
+        topics: I,
         load: impl FnOnce() -> Result<M, E>,
     ) -> Result<Unlent<'_, T, M>, E>
     where
         I: Iterator<Item = (T, &'t [Passage<'t>])> + Clone,
         M: std::ops::Deref<Target = Embedder>,
     {
-        let plan = self
-            .widest(topics().map(|(_, passages)| passages))
+        let mut plan = self
+            .widest(topics.clone().map(|(_, passages)| passages))
             .map(str::to_string);
-        let (supplied, to_embed) = self.split(&self.revision, plan.as_deref(), topics());
-        if to_embed.is_empty() {
-            return Ok(Unlent {
-                model: None,
-                plan,
-                supplied,
-                to_embed,
-            });
+        let (mut supplied, mut to_embed) =
+            self.split(&self.revision, plan.as_deref(), topics.clone());
+        let mut model = None;
+        if !to_embed.is_empty() {
+            let loaded = load()?;
+            plan = loaded.reusable_encoding();
+            (supplied, to_embed) = self.split(&loaded.revision(), plan.as_deref(), topics);
+            model = Some(loaded);
         }
-        let model = load()?;
-        let plan = model.reusable_encoding();
-        let (supplied, to_embed) = self.split(&model.revision(), plan.as_deref(), topics());
         Ok(Unlent {
-            model: Some(model),
+            model,
             plan,
             supplied,
             to_embed,

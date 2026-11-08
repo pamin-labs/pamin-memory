@@ -2991,7 +2991,6 @@ impl Engine {
             .iter()
             .map(|(_, _, passages)| passages.as_slice())
             .collect();
-        let unlent_at = || unlent_passages.iter().copied().enumerate();
         // Read before the locks, so no round trip runs under them. Nothing
         // syncs this index in between: a rebuilding engine is reached by
         // nothing but its rebuild until the rebuild returns it.
@@ -3010,7 +3009,9 @@ impl Engine {
                 plan,
                 supplied,
                 to_embed,
-            } = kept.split_for_rebuild(unlent_at, || self.embedding())?;
+            } = kept.split_for_rebuild(unlent_passages.iter().copied().enumerate(), || {
+                self.embedding()
+            })?;
             let index = self.index();
 
             // What the old index holds first, in one pass over it, then
