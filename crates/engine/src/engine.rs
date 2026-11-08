@@ -23,7 +23,7 @@ use time::OffsetDateTime;
 
 use crate::Settings;
 use crate::cuts::Cuts;
-use crate::kept::{Embedded, Kept, Passage, digests, span_documents, widen};
+use crate::kept::{Embedded, Kept, Passage, digests, span_documents, write_supplied};
 
 pub use memory_core::Depths;
 
@@ -270,12 +270,11 @@ where
         fresh.iter().map(|&at| (at, passages[at])),
     );
     if !supplied.is_empty() {
-        let vectors = widen(&supplied);
-        let documents = span_documents(
-            supplied.iter().map(|(at, _)| wanted[*at]),
-            vectors.iter().map(Vec::as_slice),
-        );
-        index().replace(&documents, reusable.as_deref())?;
+        write_supplied(
+            &supplied,
+            |&at| wanted[at],
+            |documents| index().replace(documents, reusable.as_deref()),
+        )?;
     }
     if to_embed.is_empty() {
         return Ok(Vec::new());
@@ -3017,14 +3016,11 @@ impl Engine {
                 })?;
             }
             for batch in supplied.chunks(REINDEX_BATCH) {
-                let vectors = widen(batch);
-                let documents = span_documents(
-                    batch
-                        .iter()
-                        .map(|&(at, _)| (unlent[at].0, wanted[&unlent[at].0].as_slice())),
-                    vectors.iter().map(Vec::as_slice),
-                );
-                index.write_spans(&documents, plan.as_deref())?;
+                write_supplied(
+                    batch,
+                    |&at| (unlent[at].0, wanted[&unlent[at].0].as_slice()),
+                    |documents| index.write_spans(documents, plan.as_deref()),
+                )?;
             }
             // Every span of every topic left to embed, a batch of spans at a
             // time: a topic's spans can straddle two batches, and each is

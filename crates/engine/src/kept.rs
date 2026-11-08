@@ -40,7 +40,7 @@ pub(crate) type Supplied<'k, T> = Vec<(T, Vec<&'k VectorCodes>)>;
 /// Vectors one model revision embedded, by plan, then by passage hash.
 ///
 /// Held as their fp16 codes, half what they widen to, and widened a batch at
-/// a time as they are written ([`widen`]).
+/// a time as they are written ([`write_supplied`]).
 #[derive(Default)]
 pub(crate) struct Kept {
     pub(crate) revision: String,
@@ -117,13 +117,24 @@ pub(crate) fn digests<'t>(topics: impl IntoIterator<Item = &'t [Passage<'t>]>) -
         .collect()
 }
 
-/// Supplied vectors widened back to what the index stores, in order.
-pub(crate) fn widen<T>(supplied: &[(T, Vec<&VectorCodes>)]) -> Vec<Vec<f32>> {
-    supplied
+/// Writes the topics `supplied` from their kept vectors, widened back to
+/// what the index stores, with `write`; `topic` names each one's topic and
+/// spans.
+pub(crate) fn write_supplied<'a, T, E>(
+    supplied: &[(T, Vec<&VectorCodes>)],
+    topic: impl Fn(&T) -> (TopicId, &'a [SpanSource<'a>]),
+    write: impl FnOnce(&[SpanDocument<'_>]) -> Result<(), E>,
+) -> Result<(), E> {
+    let vectors: Vec<Vec<f32>> = supplied
         .iter()
         .flat_map(|(_, vectors)| vectors)
         .map(|codes| memory_index::widen_vector(codes))
-        .collect()
+        .collect();
+    let documents = span_documents(
+        supplied.iter().map(|(at, _)| topic(at)),
+        vectors.iter().map(Vec::as_slice),
+    );
+    write(&documents)
 }
 
 /// What one pass embedded, as `span_vectors` keeps it: the model revision and
