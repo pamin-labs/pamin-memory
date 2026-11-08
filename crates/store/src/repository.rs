@@ -129,7 +129,7 @@ pub struct PurgedProject {
     pub synced: Vec<String>,
 }
 
-/// Deletes the project with this name and every row it owns, for good.
+/// Deletes this project and every row it owns, for good.
 ///
 /// Unlike a retraction, which closes a validity interval and keeps the
 /// history, this is for privacy requests: nothing of the project is left to

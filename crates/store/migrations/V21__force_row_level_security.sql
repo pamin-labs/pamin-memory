@@ -10,8 +10,7 @@
 -- A superuser still skips it, so a local workspace, whose connection is one,
 -- behaves as before. Foreign-key cascades skip it too, so deleting a project
 -- still removes its rows. A later migration that rewrites a guarded table's
--- rows must run them under `SET ROLE` with each project named, or with row
--- security off for its own session.
+-- rows has to lift the force around them; `migrate.rs` says how.
 
 DO $$
 DECLARE
