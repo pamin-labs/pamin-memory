@@ -3139,7 +3139,8 @@ fn a_server_without_its_index_rebuilds_it_on_first_use() {
         .expect("the project's index directory");
     std::fs::remove_dir_all(&project).expect("empty the index");
     std::fs::create_dir(&project).expect("the directory again");
-    std::fs::write(project.join(".rebuilding"), b"").expect("the marker");
+    std::fs::write(project.join(memory_engine::Engine::UNFINISHED_REBUILD), b"")
+        .expect("the marker");
 
     let server = cli.serve();
     let found = contents(&cli.json(&["search", QUERY, "--limit", "1"]));
@@ -3148,7 +3149,7 @@ fn a_server_without_its_index_rebuilds_it_on_first_use() {
         "an unfinished rebuild was not finished on first use: {found:?}"
     );
     assert!(
-        !project.join(".rebuilding").exists(),
+        !memory_engine::Engine::rebuild_unfinished(&project),
         "a finished rebuild removes its marker"
     );
     stop(server, &cli);
@@ -3160,5 +3161,5 @@ fn a_server_without_its_index_rebuilds_it_on_first_use() {
 fn stop(mut server: std::process::Child, cli: &Cli) {
     server.kill().expect("stopping the server");
     server.wait().expect("reaping the server");
-    let _ = std::fs::remove_file(cli.home().join("pamin.sock"));
+    let _ = std::fs::remove_file(cli.home().join(memory_client::protocol::SOCKET));
 }
