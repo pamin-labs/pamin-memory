@@ -8,8 +8,15 @@
 
 use memory_client::settings::{DATABASE_URL, Server};
 
-/// What the engine runs with, for a server resolved as `server`.
-pub fn engine(server: &Server) -> anyhow::Result<memory_engine::Settings> {
+/// What the engine runs with, for a server resolved as `server` and the
+/// external database `url`, if one is named. The URL is read from the
+/// environment alone, by [`database_url`]: it holds credentials, which belong
+/// in neither a flag, `config.toml`, nor the settings a client sends the
+/// server and prints.
+pub fn engine(
+    server: &Server,
+    url: Option<memory_store::DatabaseUrl>,
+) -> anyhow::Result<memory_engine::Settings> {
     let default = memory_engine::Settings::default();
     Ok(memory_engine::Settings {
         inference: memory_index::InferenceSettings {
@@ -21,10 +28,7 @@ pub fn engine(server: &Server) -> anyhow::Result<memory_engine::Settings> {
             split_embeddings: server.split_embeddings,
             ..default.inference
         },
-        // The database URL from the environment alone: it holds credentials,
-        // which belong in neither a flag, `config.toml`, nor the settings a
-        // client sends the server and prints.
-        store: store(server, database_url()?)?,
+        store: store(server, url)?,
         model_idle: server.model_idle,
         models_dir: server.models_dir.clone(),
         ..default
@@ -92,25 +96,16 @@ mod tests {
         let server =
             memory_client::settings::Server::resolve(root.path(), &parsed.server, &matches)
                 .unwrap();
-        // `PAMIN_MEMORY_DEVICE` and the external database may be set by
-        // whoever runs the tests; nothing else is read from the environment.
+        // `PAMIN_MEMORY_DEVICE` may be set by whoever runs the tests; nothing else is
+        // read from the environment.
         let settings = memory_engine::Settings {
             inference: memory_index::InferenceSettings {
                 device: server.device,
                 ..Default::default()
             },
-            store: memory_store::StoreSettings {
-                external: super::database_url()
-                    .unwrap()
-                    .map(|url| memory_store::External {
-                        url,
-                        connections: None,
-                    }),
-                ..Default::default()
-            },
             ..Default::default()
         };
-        assert_eq!(super::engine(&server).unwrap(), settings);
+        assert_eq!(super::engine(&server, None).unwrap(), settings);
         assert_eq!(server.open_indexes, OPEN_INDEXES);
     }
 
