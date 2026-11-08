@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use memory_core::{VectorIndex, Workspace};
 
+use crate::settings::DATABASE_URL;
 use crate::{client, output, protocol, settings};
 
 #[derive(Parser)]
@@ -120,12 +121,12 @@ pub enum Command {
     /// Stop the local database server, and the resident server if one is up.
     Stop,
 
+    // Built from the constant, not a doc comment, so the variable is named once.
     #[command(about = format!(
         "Apply this release's schema migrations to the external database named \
-         by `{}`, once per deploy, before starting the servers that need them. \
-         Servers on that database never migrate it themselves; a workspace's own \
-         cluster migrates when it opens",
-        settings::DATABASE_URL
+         by `{DATABASE_URL}`, once per deploy, before starting the servers that need \
+         them. Servers on that database never migrate it themselves; a workspace's \
+         own cluster migrates when it opens"
     ))]
     Migrate,
 

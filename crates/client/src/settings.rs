@@ -187,6 +187,7 @@ pub struct ServerArgs {
     )]
     pub postgres_dir: Option<PathBuf>,
 
+    // Built from the constant, not a doc comment, so the variable is named once.
     #[arg(
         long,
         value_name = "N",
