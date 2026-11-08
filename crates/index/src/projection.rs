@@ -1970,10 +1970,17 @@ impl Previous {
     pub fn discard(self) -> Result<()> {
         let Self { index, dir, .. } = self;
         drop(index);
-        let gone = dir.with_extension("discarded");
+        let gone = Self::discarding(&dir);
         ProjectionIndex::discard(&gone)?;
         std::fs::rename(&dir, &gone)?;
         ProjectionIndex::discard(&gone)
+    }
+
+    /// Where [`discard`](Self::discard) moves the set-aside index of `dir`
+    /// before deleting it. Public so a test can check nothing is left there.
+    #[doc(hidden)]
+    pub fn discarding(dir: &Path) -> std::path::PathBuf {
+        dir.with_extension("discarded")
     }
 }
 
