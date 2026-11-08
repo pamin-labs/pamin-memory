@@ -312,8 +312,11 @@ impl Session {
     pub async fn engine(&self, project: &str, vector_index: VectorIndex) -> Result<Arc<Engine>> {
         let engine = self
             .engines
-            .get_or_open(project.to_string(), || async {
-                let engine = Engine::attached(
+            // A missing or unfinished index is rebuilt inside the open, which
+            // holds the slot: every caller waits for the rebuild, and one that
+            // fails leaves the slot empty.
+            .get_or_open(project.to_string(), || {
+                Engine::attached(
                     self.database.clone(),
                     &self.models,
                     &self.workspace,
@@ -321,23 +324,6 @@ impl Session {
                     vector_index,
                     Access::ReadWrite,
                 )
-                .await?;
-                if !engine.needs_rebuild() {
-                    return Ok(engine);
-                }
-                // Inside the open, which holds the slot: every caller waits
-                // for the rebuild, and one that fails leaves the slot empty.
-                // Dropped first: it holds the directory's lock.
-                drop(engine);
-                Ok(Engine::rebuilt_attached(
-                    self.database.clone(),
-                    &self.models,
-                    &self.workspace,
-                    project,
-                    vector_index,
-                )
-                .await?
-                .0)
             })
             .await?;
         if engine.vector_index() != vector_index {

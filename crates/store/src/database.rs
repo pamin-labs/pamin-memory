@@ -198,8 +198,8 @@ impl Database {
         crate::migrate::run(&database.pool).await
     }
 
-    /// A pool on the external server at `url`, refused when its login would
-    /// skip row-level security.
+    /// A pool on the external server at `url`, with a warning when a role it
+    /// relies on would skip row-level security.
     async fn external(
         url: &DatabaseUrl,
         connections: Connections,
@@ -208,7 +208,14 @@ impl Database {
         let database = Self {
             pool: pool(&url.0, connections, Reach::Remote, cap).await?,
         };
-        database.bound_by_row_level_security().await?;
+        let skipping = database.skipping_row_level_security().await?;
+        if !skipping.is_empty() {
+            tracing::warn!(
+                roles = ?skipping,
+                "these database roles are superusers or have BYPASSRLS, so queries they run \
+                 skip row-level security and are not confined to one project"
+            );
+        }
         Ok(database)
     }
 
@@ -219,26 +226,23 @@ impl Database {
         })
     }
 
-    /// Refuses a login that skips row-level security, a superuser or one
-    /// with `BYPASSRLS`: hosted, the database is the second guard on which
-    /// project a query reaches, and whatever such a login runs as itself,
-    /// outside a [`scoped`](Self::scoped) transaction, skips that guard
-    /// without a sign. Managed servers often hand out an administrator login
-    /// like that.
-    async fn bound_by_row_level_security(&self) -> Result<()> {
-        let (bypasses,): (bool,) = sqlx::query_as(
-            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    /// The login and the guarded role, whichever is a superuser or has
+    /// `BYPASSRLS` and so skips row-level security: the login for what it runs
+    /// outside a [`scoped`](Self::scoped) transaction, the guarded role for
+    /// everything scoped. V20 makes the guarded role with neither, so either
+    /// is an operator's grant, warned about rather than refused; managed
+    /// servers often hand out an administrator login like that.
+    #[doc(hidden)]
+    pub async fn skipping_row_level_security(&self) -> Result<Vec<String>> {
+        let roles: Vec<(String,)> = sqlx::query_as(
+            "SELECT rolname::text FROM pg_roles
+              WHERE rolname IN (current_user, $1) AND (rolsuper OR rolbypassrls)
+              ORDER BY rolname",
         )
-        .fetch_one(&self.pool)
+        .bind(APP_ROLE)
+        .fetch_all(&self.pool)
         .await?;
-        if bypasses {
-            return Err(crate::StoreError::Role(
-                "the database role is a superuser or has BYPASSRLS, so it would skip \
-                 row-level security; use a role that has neither"
-                    .into(),
-            ));
-        }
-        Ok(())
+        Ok(roles.into_iter().map(|(role,)| role).collect())
     }
 
     /// Wraps a pool the caller built, for a caller that needs a particular
