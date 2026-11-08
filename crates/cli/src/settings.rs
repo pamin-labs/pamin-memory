@@ -47,8 +47,10 @@ fn store(
     Ok(memory_store::StoreSettings {
         jit: server.jit,
         postgres_dir: server.postgres_dir.clone(),
-        database_url: url,
-        database_connections: server.database_connections.map(std::num::NonZeroU32::get),
+        external: url.map(|url| memory_store::External {
+            url,
+            connections: server.database_connections,
+        }),
     })
 }
 
@@ -98,7 +100,12 @@ mod tests {
                 ..Default::default()
             },
             store: memory_store::StoreSettings {
-                database_url: super::database_url().unwrap(),
+                external: super::database_url()
+                    .unwrap()
+                    .map(|url| memory_store::External {
+                        url,
+                        connections: None,
+                    }),
                 ..Default::default()
             },
             ..Default::default()
@@ -126,6 +133,9 @@ mod tests {
         );
         let url = memory_store::DatabaseUrl("postgres://node@db/memory".to_string());
         let store = super::store(&server, Some(url)).unwrap();
-        assert_eq!(store.database_connections, Some(2));
+        assert_eq!(
+            store.external.unwrap().connections,
+            std::num::NonZeroU32::new(2)
+        );
     }
 }
