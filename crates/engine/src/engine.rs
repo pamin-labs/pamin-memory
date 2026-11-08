@@ -2844,25 +2844,10 @@ impl Engine {
     }
 
     /// Indexes the ledger into the empty index a rebuilding open made
-    /// (`assemble`), and clears the marker it wrote.
+    /// (`assemble`), and clears the marker it wrote once the index is whole.
+    /// A rebuild that fails part way returns before that, so the next open
+    /// finds the index unfinished.
     async fn reindex(&self) -> Result<Rebuilt> {
-        // Marked unfinished by `assemble`, so an open after a failed or
-        // killed rebuild knows the index is partial; cleared once it is whole.
-        let marker = self.dir.join(UNFINISHED_REBUILD);
-        let rebuilt = self.reindex_unmarked().await?;
-        // The index is whole either way: a marker left behind costs the next
-        // open a rebuild it did not need, which is no reason to fail this one.
-        if let Err(error) = tokio::fs::remove_file(&marker).await {
-            tracing::warn!(
-                %error,
-                marker = %marker.display(),
-                "rebuilt the index but could not remove its marker; the next open rebuilds it again"
-            );
-        }
-        Ok(rebuilt)
-    }
-
-    async fn reindex_unmarked(&self) -> Result<Rebuilt> {
         // Before the states are read: the pointer decides which state a topic
         // resolves to, so a rebuild that trusted a stale one would index the
         // wrong content and look like it had worked.
@@ -2997,6 +2982,17 @@ impl Engine {
             }
             Ok::<_, memory_index::IndexError>(lent.len())
         })?;
+
+        // The index is whole either way: a marker left behind costs the next
+        // open a rebuild it did not need, which is no reason to fail this one.
+        let marker = self.dir.join(UNFINISHED_REBUILD);
+        if let Err(error) = tokio::fs::remove_file(&marker).await {
+            tracing::warn!(
+                %error,
+                marker = %marker.display(),
+                "rebuilt the index but could not remove its marker; the next open rebuilds it again"
+            );
+        }
 
         Ok(Rebuilt {
             indexed: states.len(),
