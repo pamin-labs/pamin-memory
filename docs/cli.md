@@ -315,7 +315,7 @@ measured; the evaluation harnesses set them as `PAMIN_MEMORY_EVAL_*` variables, 
 `pamin-memory` itself never reads. `pamin-memory search` has two hidden flags of the same
 kind; see [`pamin-memory search`](#pamin-memory-search). The only variables `pamin-memory` reads are
 `PAMIN_MEMORY_HOME`, `PAMIN_MEMORY_PROJECT`, `PAMIN_MEMORY_VECTOR_INDEX`, `PAMIN_MEMORY_DEVICE`,
-`PAMIN_MEMORY_LOG` and the server's `PAMIN_MEMORY_DATABASE_URL`; the ones that used to configure anything else are refused, as
+`PAMIN_MEMORY_MODELS_DIR`, `PAMIN_MEMORY_LOG` and the server's `PAMIN_MEMORY_DATABASE_URL`; the ones that used to configure anything else are refused, as
 [Upgrading from settings variables](#upgrading-from-settings-variables)
 lists, and a unit test checks this page against what the binary reads.
 
