@@ -336,8 +336,6 @@ pub struct Engine {
     pub(crate) access: Access,
     /// What a rebuild holds until [`reindex`](Self::reindex) has finished.
     rebuilding: Arc<Mutex<Option<Rebuilding>>>,
-    /// See [`needs_rebuild`](Self::needs_rebuild).
-    needs_rebuild: bool,
     /// Index writes that are applied but not yet on disk, with their claims.
     ///
     /// The projection buffers a write in memory and a query reads that buffer,
@@ -885,16 +883,23 @@ impl Engine {
             project,
             vector_index,
             access,
-            false,
+            Rebuild::Never,
         )
         .await
     }
 
-    /// Opens against a database that is already up.
+    /// Opens against a database that is already up, rebuilding the index from
+    /// the ledger first when it is missing or a rebuild left it unfinished and
+    /// `access` can write.
     ///
     /// `Database::open` probes the cluster and runs the migrations, which is
     /// right once per process and wasteful once per request. A caller holding
     /// a database -- which is what a resident server is -- passes it in.
+    ///
+    /// The ledger is the authority and the index is derived from it, so an
+    /// index can be gone while the memories are not: a node whose disk was
+    /// replaced, or restored from a copy that did not hold this project.
+    /// Opened as it is, it would answer every search with nothing.
     pub async fn attached(
         database: Database,
         models: &Models,
@@ -910,7 +915,7 @@ impl Engine {
             project,
             vector_index,
             access,
-            false,
+            Rebuild::IfUnfinished,
         )
         .await
     }
@@ -953,23 +958,9 @@ impl Engine {
             project,
             vector_index,
             Access::ReadWrite,
-            true,
+            Rebuild::Always,
         )
         .await
-    }
-
-    /// Whether this index has to be rebuilt from the ledger before it
-    /// answers.
-    ///
-    /// The ledger is the authority and the index is derived from it, so an
-    /// index can be gone while the memories are not: a node whose disk was
-    /// replaced, or restored from a copy that did not hold this project. An
-    /// open then creates an empty index, and every search would answer
-    /// nothing. A rebuild that stopped part way leaves a marker behind, from
-    /// when it set the old index aside until it finished indexing, so it is
-    /// caught the same way.
-    pub fn needs_rebuild(&self) -> bool {
-        self.needs_rebuild
     }
 
     /// Whether a rebuild in this index directory started and never finished.
@@ -984,7 +975,7 @@ impl Engine {
         project: &str,
         vector_index: VectorIndex,
         access: Access,
-        discard: bool,
+        rebuild: Rebuild,
     ) -> Result<Self> {
         let project = repository::ensure_project(database.pool(), project).await?;
 
@@ -1009,21 +1000,33 @@ impl Engine {
         // creating an empty one -- but not while a reshape is running here,
         // when the directory is that reshape's to move.
         let exclusion = crate::reshape::exclusive(&dir);
-        let exclusive = if discard {
+        let exclusive = if rebuild == Rebuild::Always {
             Some(exclusion.lock_owned().await)
         } else {
             exclusion.try_lock_owned().ok()
         };
-        if exclusive.is_some() {
-            off_the_runtime(|| memory_index::Reshape::recover(&dir))?;
-        }
-        // Only a rebuild keeps it past the open.
-        let exclusive = exclusive.filter(|_| discard);
+        // Unfinished: the ledger holds memories its index does not, because
+        // the index is missing or a rebuild stopped part way. Decided before
+        // the open, which creates the directory, and only with the directory
+        // in hand: a reshape running here may have it aside for a moment. A
+        // workspace on the shared layout is not, since only `reindex` moves it
+        // off that.
+        let unfinished = exclusive.is_some()
+            && off_the_runtime(|| {
+                memory_index::Reshape::recover(&dir)?;
+                Ok::<_, memory_index::IndexError>(
+                    documents > 0
+                        && !std::fs::exists(&legacy)?
+                        && (!std::fs::exists(&dir)? || Self::rebuild_unfinished(&dir)),
+                )
+            })?;
+        let discard = match rebuild {
+            Rebuild::Always => true,
+            Rebuild::IfUnfinished => unfinished && access == Access::ReadWrite,
+            Rebuild::Never => false,
+        };
 
-        let (index, previous, needs_rebuild) = off_the_runtime(|| {
-            // Read before the open, which creates the directory.
-            let needs_rebuild =
-                !discard && documents > 0 && (!dir.exists() || Self::rebuild_unfinished(&dir));
+        let (index, previous) = off_the_runtime(|| {
             // Set aside rather than deleted, so the rebuild can take the
             // vectors it still holds instead of embedding every memory again.
             let previous = if discard {
@@ -1031,16 +1034,19 @@ impl Engine {
                 // A rebuild is also the migration off the shared layout, which
                 // is what the error about it tells the caller to run.
                 ProjectionIndex::discard(&legacy)?;
-                // Marked before the empty index opens: a stop from here until
-                // `reindex` finishes leaves an index missing what the ledger
-                // holds, which the next open has to find unfinished rather
-                // than complete.
-                std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join(UNFINISHED_REBUILD), b"")?;
                 previous
             } else {
                 None
             };
+            // Marked before the empty index opens: a stop from here until
+            // `reindex` finishes leaves an index missing what the ledger
+            // holds, which the next open has to find unfinished rather than
+            // complete. An open that is not rebuilding marks a missing index
+            // the same way, so that whichever open comes next rebuilds it.
+            if discard || (unfinished && !std::fs::exists(&dir)?) {
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join(UNFINISHED_REBUILD), b"")?;
+            }
 
             let index = ProjectionIndex::open_as(
                 &dir,
@@ -1058,11 +1064,10 @@ impl Engine {
             Ok::<_, memory_index::IndexError>((
                 Arc::new(index) as Arc<dyn Projection + Send + Sync>,
                 previous,
-                needs_rebuild,
             ))
         })?;
 
-        Ok(Self {
+        let engine = Self {
             database,
             worker: format!("{}:{}", hostname(), std::process::id()),
             // Taken from the index rather than built here, so what this
@@ -1076,17 +1081,23 @@ impl Engine {
             index: Arc::new(std::sync::RwLock::new(index)),
             dir,
             access,
-            rebuilding: Arc::new(Mutex::new(exclusive.map(|exclusive| Rebuilding {
-                previous,
-                _exclusive: exclusive,
+            // Only a rebuild keeps the reshape held past the open.
+            rebuilding: Arc::new(Mutex::new(exclusive.filter(|_| discard).map(|exclusive| {
+                Rebuilding {
+                    previous,
+                    _exclusive: exclusive,
+                }
             }))),
-            needs_rebuild,
             embedder: std::sync::OnceLock::new(),
             vector_index,
             models: models.clone(),
             preloads: Preloads::default(),
             project: project.id,
-        })
+        };
+        if discard && rebuild == Rebuild::IfUnfinished {
+            engine.reindex().await?;
+        }
+        Ok(engine)
     }
 
     /// The projection, alone: every write, and every read that is not a
@@ -2832,13 +2843,11 @@ impl Engine {
         Ok((ChannelResults::new(Channel::Graph, candidates), paths))
     }
 
-    /// Indexes the ledger into the empty index
-    /// [`rebuilding_attached`](Self::rebuilding_attached) opened, and clears
-    /// the marker it wrote.
+    /// Indexes the ledger into the empty index a rebuilding open made
+    /// (`assemble`), and clears the marker it wrote.
     async fn reindex(&self) -> Result<Rebuilt> {
-        // Marked unfinished when the old index was set aside (`assemble`),
-        // so an open after a failed or killed rebuild knows the index is
-        // partial; cleared once it is whole.
+        // Marked unfinished by `assemble`, so an open after a failed or
+        // killed rebuild knows the index is partial; cleared once it is whole.
         let marker = self.dir.join(UNFINISHED_REBUILD);
         let rebuilt = self.reindex_unmarked().await?;
         // The index is whole either way: a marker left behind costs the next
@@ -3085,8 +3094,21 @@ pub struct Recorded {
 }
 
 /// Left in an index directory from when a rebuild sets the old index aside
-/// until it finishes indexing.
+/// until it finishes indexing, and in one an open created for a project whose
+/// index was missing.
 const UNFINISHED_REBUILD: &str = ".rebuilding";
+
+/// Whether an open rebuilds its index from the ledger.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    /// The index is opened as it is; one it had to create is marked
+    /// unfinished for the next open.
+    Never,
+    /// When the index is missing or unfinished, and the open can write.
+    IfUnfinished,
+    /// An explicit rebuild ([`Engine::rebuilt_attached`]).
+    Always,
+}
 
 /// What a rebuild did.
 #[derive(Clone, Copy, Debug)]
