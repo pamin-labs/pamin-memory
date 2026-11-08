@@ -93,7 +93,18 @@ pub struct External {
 
 /// A `postgres://` URL. It carries credentials, so it never prints.
 #[derive(Clone, PartialEq, Eq)]
-pub struct DatabaseUrl(pub String);
+pub struct DatabaseUrl(String);
+
+impl DatabaseUrl {
+    /// Taken as given: connecting is what parses it.
+    pub fn new(url: String) -> Self {
+        Self(url)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl std::fmt::Debug for DatabaseUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,7 +234,7 @@ impl Database {
             .test_before_acquire(true)
             .idle_timeout(Duration::from_secs(5 * 60))
             .max_lifetime(Duration::from_secs(30 * 60))
-            .connect(&url.0)
+            .connect(url.as_str())
             .await?;
         let database = Self { pool };
         let skipping = database.skipping_row_level_security().await?;

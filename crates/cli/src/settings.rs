@@ -64,7 +64,7 @@ pub(crate) fn database_url() -> anyhow::Result<Option<memory_store::DatabaseUrl>
         Ok(url) if url.trim().is_empty() => {
             anyhow::bail!("{DATABASE_URL} is empty; unset it to use the workspace's own cluster")
         }
-        Ok(url) => Ok(Some(memory_store::DatabaseUrl(url))),
+        Ok(url) => Ok(Some(memory_store::DatabaseUrl::new(url))),
     }
 }
 
@@ -131,7 +131,7 @@ mod tests {
             error.contains(memory_client::settings::DATABASE_URL),
             "{error}"
         );
-        let url = memory_store::DatabaseUrl("postgres://node@db/memory".to_string());
+        let url = memory_store::DatabaseUrl::new("postgres://node@db/memory".to_string());
         let store = super::store(&server, Some(url)).unwrap();
         assert_eq!(
             store.external.unwrap().connections,

@@ -29,7 +29,7 @@ async fn an_external_server_is_used_and_never_started() {
     let (_, address) = server.split_once('@').expect("credentials in the URL");
     let on = |url: String| StoreSettings {
         external: Some(External {
-            url: DatabaseUrl(url),
+            url: DatabaseUrl::new(url),
             connections: None,
         }),
         ..common::store()
