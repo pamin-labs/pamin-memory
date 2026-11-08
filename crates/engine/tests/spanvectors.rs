@@ -3,8 +3,7 @@
 //! Ignored by default: it provisions PostgreSQL and downloads the embedding
 //! model. Run with `cargo test -p memory-engine --test spanvectors -- --ignored`.
 
-#[path = "../../index/tests/support/mod.rs"]
-mod support;
+mod harness;
 
 use memory_core::{Fusion, TopicStateId, Validity};
 use memory_engine::{Depths, Engine, Owed};
@@ -28,27 +27,13 @@ const MEMORIES: [(&str, &str); 3] = [
     ),
 ];
 
-fn settings() -> memory_engine::Settings {
-    support::eval::check();
-    memory_engine::Settings {
-        inference: support::inference(),
-        store: memory_store::StoreSettings {
-            jit: support::eval::switch("PAMIN_MEMORY_EVAL_JIT").unwrap_or_default(),
-            postgres_dir: support::eval::path("PAMIN_MEMORY_EVAL_POSTGRES_DIR"),
-            database_url: None,
-            database_connections: None,
-        },
-        ..memory_engine::Settings::default()
-    }
-}
-
 async fn open(workspace: &Workspace, name: &str) -> Engine {
     Engine::open(
         workspace,
         name,
         VectorIndex::default(),
         Access::ReadWrite,
-        &settings(),
+        &harness::settings(),
     )
     .await
     .expect("open the engine")
@@ -92,9 +77,13 @@ async fn seen(engine: &Engine, topic: &str) -> TopicStateId {
 async fn a_rebuild_from_kept_vectors_loads_no_model() {
     let scratch = tempfile::tempdir().expect("temp workspace");
     let workspace = Workspace::at(scratch.path());
-    let database = Database::open(&workspace, Connections::PerCommand, &settings().store)
-        .await
-        .expect("open the database");
+    let database = Database::open(
+        &workspace,
+        Connections::PerCommand,
+        &harness::settings().store,
+    )
+    .await
+    .expect("open the database");
     let name = format!("spanvectors-{}", uuid::Uuid::now_v7());
     let project = repository::ensure_project(database.pool(), &name)
         .await
@@ -254,12 +243,16 @@ async fn rebuild(
 
 /// The project's index rebuilt from the ledger, as the server rebuilds it.
 async fn rebuilt(workspace: &Workspace, name: &str) -> (Engine, memory_engine::Rebuilt) {
-    let database = Database::open(workspace, Connections::PerCommand, &settings().store)
-        .await
-        .expect("open the database");
+    let database = Database::open(
+        workspace,
+        Connections::PerCommand,
+        &harness::settings().store,
+    )
+    .await
+    .expect("open the database");
     Engine::rebuilt_attached(
         database,
-        &memory_engine::Models::new(settings()),
+        &memory_engine::Models::new(harness::settings()),
         workspace,
         name,
         VectorIndex::default(),
