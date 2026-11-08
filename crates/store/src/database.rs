@@ -75,8 +75,9 @@ pub struct StoreSettings {
     pub postgres_dir: Option<std::path::PathBuf>,
     /// A PostgreSQL server to use instead of the workspace's own cluster, for
     /// a hosted deployment whose disk is not where its data lives. Nothing is
-    /// installed, started or recorded for it; the store only connects and
-    /// migrates. `jit` and `postgres_dir` do not apply.
+    /// installed, started or recorded for it: the store connects, and refuses
+    /// it until [`Database::migrate`] has applied this release's migrations.
+    /// `jit` and `postgres_dir` do not apply.
     pub external: Option<External>,
 }
 
@@ -223,12 +224,10 @@ impl Database {
     ) -> Result<Self> {
         // An external server is reached through a proxy and an idle timer,
         // and may sleep and wake between calls, so each connection is tested
-        // and recycled before the proxy closes it. Every node sharing the
-        // server holds a pool of its own, so its connection limit is divided
-        // among them.
-        let limit = cap.map_or(connections.limit(), |cap| {
-            cap.get().min(connections.limit())
-        });
+        // and recycled before the proxy closes it; for the cap, see
+        // [`External::connections`].
+        let most = connections.limit();
+        let limit = cap.map_or(most, |cap| cap.get().min(most));
         let pool = pool_options(connections)
             .max_connections(limit)
             .test_before_acquire(true)
@@ -389,9 +388,11 @@ fn other_settings(
 /// itself, as the evaluation harnesses do, is the other case, so
 /// [`Connections`] is the caller's to state.
 ///
-/// `test_before_acquire` is off. It costs a full round trip on every acquire to
-/// detect connections dropped by a proxy or an idle timer, and there is neither
-/// between here and a cluster on this machine that this process just started.
+/// These are the settings for a cluster on this machine; [`Database::external`]
+/// layers a remote server's on them. `test_before_acquire` is off. It costs a
+/// full round trip on every acquire to detect connections dropped by a proxy or
+/// an idle timer, and there is neither between here and a cluster on this
+/// machine that this process just started.
 fn pool_options(connections: Connections) -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(connections.limit())
