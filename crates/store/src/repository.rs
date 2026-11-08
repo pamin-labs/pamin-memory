@@ -1963,11 +1963,8 @@ pub async fn put_span_vectors<'a>(
     // does not matter: one hash is one text, embedded to one vector.
     rows.sort_unstable_by_key(|(hash, _)| *hash);
     rows.dedup_by_key(|(hash, _)| *hash);
-    let (hashes, vectors): (Vec<&[u8]>, Vec<&[u8]>) = rows.into_iter().unzip();
-    for (hashes, vectors) in hashes
-        .chunks(PUT_SPAN_VECTORS_BATCH)
-        .zip(vectors.chunks(PUT_SPAN_VECTORS_BATCH))
-    {
+    for batch in rows.chunks(PUT_SPAN_VECTORS_BATCH) {
+        let (hashes, vectors): (Vec<&[u8]>, Vec<&[u8]>) = batch.iter().copied().unzip();
         sqlx::query(
             "INSERT INTO span_vectors (project_id, revision, passage_hash, encoding, vector)
              SELECT $1, $2, passage_hash, $3, vector FROM unnest($4::bytea[], $5::bytea[])
