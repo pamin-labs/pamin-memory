@@ -41,7 +41,7 @@ impl<'a> Passage<'a> {
     }
 }
 
-/// Topics written from kept vectors, each with its spans' fp16 bytes in
+/// Topics written from kept vectors, each with its spans' fp16 codes in
 /// order.
 pub(crate) type Supplied<'k, T> = Vec<(T, Vec<&'k VectorCodes>)>;
 
@@ -226,7 +226,7 @@ impl Embedded {
     }
 }
 
-/// Every span of `topics`, in order, as the index is written it, with
+/// Every span of `topics`, in order, as the index writes them, with
 /// `vectors`.
 pub(crate) fn span_documents<'a>(
     topics: impl IntoIterator<Item = (TopicId, &'a [SpanSource<'a>])>,
