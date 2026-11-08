@@ -411,21 +411,29 @@ impl Session {
         );
         self.engines
             .take_then(project.to_string(), PURGE_PATIENCE, || async {
-                let Some(id) = repository::find_project(self.database.pool(), project).await?
-                else {
-                    return Ok(None);
-                };
-                let mut transaction = self.database.scoped(id).await?;
-                let purged = repository::purge_project(&mut *transaction, id).await?;
-                if let Some(purged) = &purged {
+                // Found by name, deleted by id: a project another server purged
+                // in between, and maybe made again, is looked up afresh.
+                let purged = loop {
+                    let Some(id) = repository::find_project(self.database.pool(), project).await?
+                    else {
+                        break None;
+                    };
+                    let mut transaction = self.database.scoped(id).await?;
+                    let Some(purged) = repository::purge_project(&mut *transaction, id).await?
+                    else {
+                        continue;
+                    };
                     match tokio::fs::remove_dir_all(self.workspace.index_dir(purged.id)).await {
                         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                             return Err(error.into());
                         }
                         _ => {}
                     }
-                }
-                transaction.commit().await?;
+                    transaction.commit().await?;
+                    break Some(purged);
+                };
+                // Also when nothing was found: the id cached here may be one
+                // another server has purged.
                 self.projects.lock().await.remove(project);
                 if let (Some(purged), Some(syncing)) = (&purged, self.syncing()) {
                     for path in &purged.synced {
