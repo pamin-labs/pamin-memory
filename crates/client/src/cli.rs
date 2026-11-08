@@ -688,8 +688,10 @@ mod tests {
         expected.sort();
         assert_eq!(read, expected, "the variables the binary reads changed");
 
-        // The page's own list of what is read, up to the `;` that ends it.
-        let (_, list) = documented
+        // The page's own list of what is read, up to the `;` that ends it,
+        // however the paragraph is wrapped.
+        let prose = documented.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (_, list) = prose
             .split_once("The only variables `pamin-memory` reads are")
             .expect("docs/cli.md lists the variables read");
         let (list, _) = list.split_once(';').expect("the list ends with `;`");
@@ -702,7 +704,7 @@ mod tests {
         listed.sort();
         assert_eq!(
             listed, expected,
-            "docs/cli.md lists other variables as read"
+            "docs/cli.md's list of variables read is not READ"
         );
 
         for name in READ {

@@ -3161,5 +3161,7 @@ fn a_server_without_its_index_rebuilds_it_on_first_use() {
 fn stop(mut server: std::process::Child, cli: &Cli) {
     server.kill().expect("stopping the server");
     server.wait().expect("reaping the server");
-    let _ = std::fs::remove_file(cli.home().join(memory_client::protocol::SOCKET));
+    let _ = std::fs::remove_file(memory_client::protocol::socket_path(
+        &memory_core::Workspace::at(cli.home()),
+    ));
 }

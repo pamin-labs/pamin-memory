@@ -88,7 +88,7 @@ pub struct External {
     pub url: DatabaseUrl,
     /// Every node sharing the server holds a pool of its own, so their caps
     /// together have to fit its connection limit. Unset, a node opens up to
-    /// [`Connections::limit`].
+    /// [`Connections::limit`], and never more than it when set.
     pub connections: Option<NonZeroU32>,
 }
 

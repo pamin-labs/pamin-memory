@@ -942,7 +942,7 @@ fn a_rebuild_reuses_only_the_vectors_of_unchanged_text() {
     );
     previous.discard().expect("discard");
     assert!(!dir.with_extension("previous").exists());
-    assert!(!dir.with_extension("discarded").exists());
+    assert!(!Previous::discarding(&dir).exists());
 
     // Built from content alone: its vectors are not what an index built now
     // computes, so it lends nothing and is discarded.
