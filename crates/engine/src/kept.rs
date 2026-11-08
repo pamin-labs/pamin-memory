@@ -311,8 +311,7 @@ impl Engine {
     /// Deployments that ship the model cached never meet this; ask the loaded
     /// model's revision instead if a node ever starts without it.
     pub(crate) async fn kept_for_rebuild(&self, topics: &[&[Passage<'_>]]) -> Kept {
-        let Some(revision) = off_the_runtime(|| memory_index::cached_revision(&self.models.dir))
-        else {
+        let Some(revision) = off_the_runtime(|| self.models.cached_revision()) else {
             return Kept::default();
         };
         // ponytail: holds every kept vector of these topics at once, so a

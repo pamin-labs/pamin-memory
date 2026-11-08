@@ -564,7 +564,7 @@ struct Rebuilding {
 /// decides nothing about them.
 #[derive(Clone)]
 pub struct Models {
-    pub(crate) dir: std::path::PathBuf,
+    dir: std::path::PathBuf,
     /// What this process was started with: how the models load, how long
     /// they are held, and what every engine opened on them is given.
     settings: Arc<Settings>,
@@ -590,6 +590,12 @@ impl Models {
     /// What this process was started with.
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// The revision the next load of the embedder runs, without loading it
+    /// ([`memory_index::cached_revision`]).
+    pub(crate) fn cached_revision(&self) -> Option<String> {
+        memory_index::cached_revision(&self.dir)
     }
 
     /// Reads and writes the weights cached in `settings`' model directory,
