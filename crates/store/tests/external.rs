@@ -1,5 +1,5 @@
 //! A store on a PostgreSQL server it did not start, as hosted memory runs:
-//! a deploy migrates it with `Database::migrate`, `StoreSettings::database_url`
+//! a deploy migrates it with `Database::migrate`, `StoreSettings::external`
 //! connects to it, and the workspace's own cluster is neither started nor
 //! recorded.
 //!
@@ -7,7 +7,9 @@
 
 mod common;
 
-use memory_store::{Connections, Database, DatabaseUrl, StoreSettings, Workspace};
+use std::num::NonZeroU32;
+
+use memory_store::{Connections, Database, DatabaseUrl, External, StoreSettings, Workspace};
 
 #[tokio::test]
 #[ignore = "needs a real postgres cluster"]
@@ -25,12 +27,15 @@ async fn an_external_server_is_used_and_never_started() {
     let superuser = record.url();
     let (server, _) = superuser.rsplit_once('/').expect("a database in the URL");
     let (_, address) = server.split_once('@').expect("credentials in the URL");
-    let external = |role: &str, database: &str| StoreSettings {
-        database_url: Some(DatabaseUrl(format!(
-            "postgresql://{role}:{role}@{address}/{database}"
-        ))),
+    let on = |url: String| StoreSettings {
+        external: Some(External {
+            url: DatabaseUrl::new(url),
+            connections: None,
+        }),
         ..common::store()
     };
+    let external =
+        |role: &str, database: &str| on(format!("postgresql://{role}:{role}@{address}/{database}"));
 
     // A hosted login: it owns its databases and is bound by row-level
     // security, with the guarded role made for it once. And one with
@@ -61,7 +66,7 @@ async fn an_external_server_is_used_and_never_started() {
         behind.to_string().contains("pamin-memory migrate"),
         "{behind}"
     );
-    let url = settings.database_url.as_ref().expect("an external URL");
+    let url = &settings.external.as_ref().expect("an external server").url;
     let applied = Database::migrate(url)
         .await
         .expect("migrate as a deploy does");
@@ -100,8 +105,11 @@ async fn an_external_server_is_used_and_never_started() {
 
     // A node's pool is capped, so nodes sharing the server fit its limit.
     let capped = StoreSettings {
-        database_connections: Some(2),
-        ..settings.clone()
+        external: Some(External {
+            url: url.clone(),
+            connections: NonZeroU32::new(2),
+        }),
+        ..common::store()
     };
     let database = Database::open(&node, Connections::Resident, &capped)
         .await
@@ -122,19 +130,13 @@ async fn an_external_server_is_used_and_never_started() {
     // The one with BYPASSRLS, and a superuser.
     for (login, role) in [
         (external("bypassing", "nodes"), "bypassing"),
-        (
-            StoreSettings {
-                database_url: Some(DatabaseUrl(format!("{server}/nodes"))),
-                ..common::store()
-            },
-            record.username.as_str(),
-        ),
+        (on(format!("{server}/nodes")), record.username.as_str()),
     ] {
         let database = Database::open(&node, Connections::PerCommand, &login)
             .await
             .unwrap_or_else(|error| panic!("open as {role}: {error}"));
         assert_eq!(skipping(database).await, [role]);
-        let url = login.database_url.as_ref().expect("an external URL");
+        let url = &login.external.as_ref().expect("an external server").url;
         Database::migrate(url)
             .await
             .unwrap_or_else(|error| panic!("migrate as {role}: {error}"));

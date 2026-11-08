@@ -120,10 +120,13 @@ pub enum Command {
     /// Stop the local database server, and the resident server if one is up.
     Stop,
 
-    /// Apply this release's schema migrations to the external database named
-    /// by `PAMIN_MEMORY_DATABASE_URL`, once per deploy, before starting the
-    /// servers that need them. Servers on that database never migrate it
-    /// themselves; a workspace's own cluster migrates when it opens.
+    #[command(about = format!(
+        "Apply this release's schema migrations to the external database named \
+         by `{}`, once per deploy, before starting the servers that need them. \
+         Servers on that database never migrate it themselves; a workspace's own \
+         cluster migrates when it opens",
+        settings::DATABASE_URL
+    ))]
     Migrate,
 
     /// Hold the database, the index and the model, and answer commands.
@@ -330,10 +333,9 @@ fn refuse_removed_settings() -> Result<()> {
 }
 
 /// The settings [`refuse_removed_settings`] turns away, and what became of
-/// each. Since only `PAMIN_MEMORY_HOME`, `PAMIN_MEMORY_PROJECT`, `PAMIN_MEMORY_VECTOR_INDEX`,
-/// `PAMIN_MEMORY_DEVICE`, `PAMIN_MEMORY_MODELS_DIR`, `PAMIN_MEMORY_LOG` and the server's
-/// `PAMIN_MEMORY_DATABASE_URL` are read, every other setting that was a variable is a
-/// flag, a `config.toml` key, or gone.
+/// each. Every setting that was a variable and is not among those still read
+/// (`READ` in the tests, and `docs/cli.md`) is a flag, a `config.toml` key,
+/// or gone.
 const REMOVED: &[(&str, &str)] = &[
     (
         "PAMIN_MEMORY_NO_SERVER",
