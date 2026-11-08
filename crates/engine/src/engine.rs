@@ -5060,6 +5060,15 @@ mod tests {
             (1, Some("cpu:other".into()), vec![], vec![0, 1]),
             "nothing kept under the model's plan"
         );
+        let another_revision = super::Kept {
+            revision: "model@other".into(),
+            ..kept("cpu:plan", &["alpha"])
+        };
+        assert_eq!(
+            split(&another_revision, "cpu:plan"),
+            (1, plan(), vec![], vec![0, 1]),
+            "another revision's vectors are not the loaded model's"
+        );
     }
 
     /// Kept vectors stand in only under the plan the model is on when they
