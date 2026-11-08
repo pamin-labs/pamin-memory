@@ -153,10 +153,11 @@ fn unheld(
 /// What a sync needs of the model: its revision and the plan a stored vector
 /// has to have been embedded under to stand in for a pass, and the pass.
 ///
-/// A trait only so the order [`write_unheld`] asks these in can be tested
-/// against a model whose plan moves; [`Embedder`] is the one implementation the
-/// product runs.
-trait PassageEncoder {
+/// A trait only so the order [`write_unheld`] asks these in, and which kept
+/// vectors a rebuild's model takes ([`Kept::split_for_rebuild`]), can be
+/// tested against a model whose plan moves; [`Embedder`] is the one
+/// implementation the product runs.
+pub(crate) trait PassageEncoder {
     /// [`Embedder::revision`].
     fn revision(&self) -> String;
     /// [`Embedder::reusable_encoding`].
@@ -5022,6 +5023,42 @@ mod tests {
             model.passes,
             [vec!["beta".to_string()]],
             "with no plan to match, nothing kept is reused"
+        );
+    }
+
+    /// A rebuild loads the model only when the widest kept plan leaves a
+    /// topic to embed, and the loaded model's own plan then decides which
+    /// kept vectors stand in.
+    #[test]
+    fn a_rebuild_loads_the_model_only_for_what_is_not_kept() {
+        let passages = ["alpha", "beta"].map(|text| [super::Passage::of(text)]);
+        let topics = || passages.iter().map(|spans| spans.as_slice()).enumerate();
+        let split = |kept: &super::Kept, plan: &str| {
+            let mut loads = 0;
+            let unlent = kept
+                .split_for_rebuild(topics(), || {
+                    loads += 1;
+                    Ok::<_, ()>(Box::new(Moving::on(plan)))
+                })
+                .expect("split");
+            let supplied: Vec<usize> = unlent.supplied.iter().map(|(at, _)| *at).collect();
+            (loads, unlent.plan, supplied, unlent.to_embed)
+        };
+        let plan = || Some("cpu:plan".to_string());
+        assert_eq!(
+            split(&kept("cpu:plan", &["alpha", "beta"]), "cpu:plan"),
+            (0, plan(), vec![0, 1], vec![]),
+            "everything kept: no model"
+        );
+        assert_eq!(
+            split(&kept("cpu:plan", &["alpha"]), "cpu:plan"),
+            (1, plan(), vec![0], vec![1]),
+            "the model's plan kept one"
+        );
+        assert_eq!(
+            split(&kept("cpu:plan", &["alpha"]), "cpu:other"),
+            (1, Some("cpu:other".into()), vec![], vec![0, 1]),
+            "nothing kept under the model's plan"
         );
     }
 

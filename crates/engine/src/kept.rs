@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use memory_core::TopicId;
-use memory_index::{Embedder, SpanDocument, SpanSource, VectorCodes};
+use memory_index::{SpanDocument, SpanSource, VectorCodes};
 use memory_store::repository;
 
-use crate::engine::{Engine, off_the_runtime};
+use crate::engine::{Engine, PassageEncoder, off_the_runtime};
 
 /// What a span's vector is embedded from, with the hash it is kept under,
 /// taken once and only if asked for.
@@ -122,7 +122,7 @@ impl Kept {
     ) -> Result<Unlent<'_, T, M>, E>
     where
         I: Iterator<Item = (T, &'t [Passage<'t>])> + Clone,
-        M: std::ops::Deref<Target = Embedder>,
+        M: std::ops::Deref<Target: PassageEncoder>,
     {
         let mut plan = self
             .widest(topics.clone().map(|(_, passages)| passages))
