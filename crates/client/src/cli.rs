@@ -120,10 +120,13 @@ pub enum Command {
     /// Stop the local database server, and the resident server if one is up.
     Stop,
 
-    /// Apply this release's schema migrations to the external database named
-    /// by `PAMIN_MEMORY_DATABASE_URL`, once per deploy, before starting the
-    /// servers that need them. Servers on that database never migrate it
-    /// themselves; a workspace's own cluster migrates when it opens.
+    #[command(about = format!(
+        "Apply this release's schema migrations to the external database named \
+         by `{}`, once per deploy, before starting the servers that need them. \
+         Servers on that database never migrate it themselves; a workspace's own \
+         cluster migrates when it opens",
+        settings::DATABASE_URL
+    ))]
     Migrate,
 
     /// Hold the database, the index and the model, and answer commands.
