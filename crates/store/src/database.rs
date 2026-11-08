@@ -210,9 +210,22 @@ impl Database {
         connections: Connections,
         cap: Option<NonZeroU32>,
     ) -> Result<Self> {
-        let database = Self {
-            pool: pool(&url.0, connections, Reach::Remote, cap).await?,
-        };
+        // An external server is reached through a proxy and an idle timer,
+        // and may sleep and wake between calls, so each connection is tested
+        // and recycled before the proxy closes it. Every node sharing the
+        // server holds a pool of its own, so its connection limit is divided
+        // among them.
+        let limit = cap.map_or(connections.limit(), |cap| {
+            cap.get().min(connections.limit())
+        });
+        let pool = pool_options(connections)
+            .max_connections(limit)
+            .test_before_acquire(true)
+            .idle_timeout(Duration::from_secs(5 * 60))
+            .max_lifetime(Duration::from_secs(30 * 60))
+            .connect(&url.0)
+            .await?;
+        let database = Self { pool };
         let skipping = database.skipping_row_level_security().await?;
         if !skipping.is_empty() {
             tracing::warn!(
@@ -227,7 +240,7 @@ impl Database {
     /// Connects to an already running server without touching its lifecycle.
     pub async fn connect(server: &LocalServer, connections: Connections) -> Result<Self> {
         Ok(Self {
-            pool: pool(&server.url(), connections, Reach::Local, None).await?,
+            pool: pool_options(connections).connect(&server.url()).await?,
         })
     }
 
@@ -353,7 +366,7 @@ fn other_settings(
     ))
 }
 
-/// Opens a pool sized for one short-lived command.
+/// A pool sized for one short-lived command, for the caller to connect.
 ///
 /// Every `pamin-memory` invocation used to be its own process with its own pool, all
 /// pointing at one cluster, so the pool's size was multiplied by however many
@@ -365,48 +378,21 @@ fn other_settings(
 /// itself, as the evaluation harnesses do, is the other case, so
 /// [`Connections`] is the caller's to state.
 ///
-/// For a cluster on this machine, `test_before_acquire` is off. It costs a full
-/// round trip on every acquire to detect connections dropped by a proxy or an
-/// idle timer, and there is neither between here and a cluster this process
-/// just started. An external server is reached through both, and its server
-/// may sleep and wake between calls, so there each connection is tested and
-/// recycled. Every node sharing it holds a pool of its own, so the server's
-/// connection limit is divided among them.
-async fn pool(
-    url: &str,
-    connections: Connections,
-    reach: Reach,
-    cap: Option<NonZeroU32>,
-) -> Result<PgPool> {
-    let remote = reach == Reach::Remote;
-    let limit = cap.map_or(connections.limit(), |cap| {
-        cap.get().min(connections.limit())
-    });
-    let pool = PgPoolOptions::new()
-        .max_connections(limit)
+/// `test_before_acquire` is off. It costs a full round trip on every acquire to
+/// detect connections dropped by a proxy or an idle timer, and there is neither
+/// between here and a cluster on this machine that this process just started.
+fn pool_options(connections: Connections) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(connections.limit())
         .min_connections(1)
-        .test_before_acquire(remote)
-        // Locally a command outlives neither, so recycling connections
-        // underneath it only adds reconnects; a remote server's proxy closes
-        // idle ones first.
-        .idle_timeout(remote.then_some(Duration::from_secs(5 * 60)))
-        .max_lifetime(remote.then_some(Duration::from_secs(30 * 60)))
+        .test_before_acquire(false)
+        // A command outlives neither, so recycling connections underneath it
+        // only adds reconnects.
+        .idle_timeout(None)
+        .max_lifetime(None)
         // Long enough to outlast a busy moment, short enough that a caller
         // learns the server is unreachable rather than appearing to hang.
         .acquire_timeout(Duration::from_secs(10))
-        .connect(url)
-        .await?;
-
-    Ok(pool)
-}
-
-/// Where a pool's server is.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reach {
-    /// The workspace's own cluster, on this machine.
-    Local,
-    /// An external server, through the network and its proxy.
-    Remote,
 }
 
 /// What this cluster is started with.
