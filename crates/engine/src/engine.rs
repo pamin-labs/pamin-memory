@@ -23,7 +23,7 @@ use time::OffsetDateTime;
 
 use crate::Settings;
 use crate::cuts::Cuts;
-use crate::kept::{Embedded, Kept, Passage, digests, span_documents, write_supplied};
+use crate::kept::{Embedded, Kept, Passage, Unlent, digests, span_documents, write_supplied};
 
 pub use memory_core::Depths;
 
@@ -2980,8 +2980,7 @@ impl Engine {
         // Read before the locks, so no round trip runs under them. Nothing
         // syncs this index in between: a rebuilding engine is reached by
         // nothing but its rebuild until the rebuild returns it.
-        let (kept, plan) = self.kept_for_rebuild(&unlent_passages).await;
-        let unloaded = kept.split(&kept.revision, plan.as_deref(), unlent_at());
+        let kept = self.kept_for_rebuild(&unlent_passages).await;
 
         let (reused, embedded) = off_the_runtime(|| {
             // Both locks, in the order every other caller takes them, and held
@@ -2991,21 +2990,12 @@ impl Engine {
             // and wanting the index. Holding both throughout also matches what
             // a rebuild has always done -- it opens the collection for writing,
             // which excluded every reader in every other process already.
-            let mut embedder = if unloaded.1.is_empty() {
-                None
-            } else {
-                Some(self.embedding()?)
-            };
-            // A model loaded after all says which kept vectors stand in: those
-            // of its own revision and plan.
-            let (plan, (supplied, to_embed)) = match &embedder {
-                Some(model) => {
-                    let plan = model.reusable_encoding();
-                    let split = kept.split(&model.revision(), plan.as_deref(), unlent_at());
-                    (plan, split)
-                }
-                None => (plan, unloaded),
-            };
+            let Unlent {
+                model: mut embedder,
+                plan,
+                supplied,
+                to_embed,
+            } = kept.split_for_rebuild(unlent_at, || self.embedding())?;
             let index = self.index();
 
             // What the old index holds first, in one pass over it, then

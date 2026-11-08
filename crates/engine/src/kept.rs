@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use memory_core::TopicId;
-use memory_index::{SpanDocument, SpanSource, VectorCodes};
+use memory_index::{Embedder, SpanDocument, SpanSource, VectorCodes};
 use memory_store::repository;
 
 use crate::engine::{Engine, off_the_runtime};
@@ -36,6 +36,17 @@ impl<'a> Passage<'a> {
 /// Topics written from kept vectors, each with its spans' fp16 bytes in
 /// order.
 pub(crate) type Supplied<'k, T> = Vec<(T, Vec<&'k VectorCodes>)>;
+
+/// How a rebuild writes the topics it could not lend
+/// ([`Kept::split_for_rebuild`]).
+pub(crate) struct Unlent<'k, T, M> {
+    /// The model, loaded only if a topic is left to embed.
+    pub(crate) model: Option<M>,
+    /// The plan the supplied topics are written under.
+    pub(crate) plan: Option<String>,
+    pub(crate) supplied: Supplied<'k, T>,
+    pub(crate) to_embed: Vec<T>,
+}
 
 /// Vectors one model revision embedded, by plan, then by passage hash.
 ///
@@ -83,13 +94,51 @@ impl Kept {
         (supplied, to_embed)
     }
 
+    /// Splits the topics a rebuild could not lend ([`Kept::split`]) under the
+    /// plan that applies, loading the model with `load` only if it must: once
+    /// the plan that covers the most of them ([`Kept::widest`]) still leaves a
+    /// topic to embed. A loaded model then decides instead, by its own
+    /// revision and plan, which are what its vectors will be of.
+    ///
+    /// ponytail: span_vectors is per project, not per node, so the widest
+    /// plan can be another node's; nodes on one kind of hardware run one plan
+    /// in practice. Checking it would mean loading the model.
+    pub(crate) fn split_for_rebuild<'t, T, I, M, E>(
+        &self,
+        topics: impl Fn() -> I,
+        load: impl FnOnce() -> Result<M, E>,
+    ) -> Result<Unlent<'_, T, M>, E>
+    where
+        I: Iterator<Item = (T, &'t [Passage<'t>])> + Clone,
+        M: std::ops::Deref<Target = Embedder>,
+    {
+        let plan = self
+            .widest(topics().map(|(_, passages)| passages))
+            .map(str::to_string);
+        let (supplied, to_embed) = self.split(&self.revision, plan.as_deref(), topics());
+        if to_embed.is_empty() {
+            return Ok(Unlent {
+                model: None,
+                plan,
+                supplied,
+                to_embed,
+            });
+        }
+        let model = load()?;
+        let plan = model.reusable_encoding();
+        let (supplied, to_embed) = self.split(&model.revision(), plan.as_deref(), topics());
+        Ok(Unlent {
+            model: Some(model),
+            plan,
+            supplied,
+            to_embed,
+        })
+    }
+
     /// The plan whose kept vectors cover the most of `topics` whole, ties to
     /// the first by name, so a choice made with no model loaded is the same
     /// every time.
-    pub(crate) fn widest<'t>(
-        &self,
-        topics: impl Iterator<Item = &'t [Passage<'t>]> + Clone,
-    ) -> Option<&str> {
+    fn widest<'t>(&self, topics: impl Iterator<Item = &'t [Passage<'t>]> + Clone) -> Option<&str> {
         // Reversed because `max_by_key` keeps the last of equals.
         self.by_plan
             .iter()
@@ -245,34 +294,24 @@ impl Engine {
     }
 
     /// What a rebuild that has not loaded the model can stand in for `topics`
-    /// with: every plan the next load's revision kept for them, and the plan
-    /// that covers the most ([`Kept::widest`]). Nothing while no revision is
-    /// pinned to match.
-    ///
-    /// ponytail: span_vectors is per project, not per node, so the widest
-    /// plan can be another node's; nodes on one kind of hardware run one plan
-    /// in practice. Checking it would mean loading the model.
+    /// with: every plan the next load's revision kept for them
+    /// ([`Kept::split_for_rebuild`]). Nothing while no revision is pinned to
+    /// match.
     ///
     /// ponytail: with no model cached there is no revision to look up by, so
     /// a rebuild embeds everything even when the database kept it all.
     /// Deployments that ship the model cached never meet this; ask the loaded
     /// model's revision instead if a node ever starts without it.
-    pub(crate) async fn kept_for_rebuild(
-        &self,
-        topics: &[&[Passage<'_>]],
-    ) -> (Kept, Option<String>) {
+    pub(crate) async fn kept_for_rebuild(&self, topics: &[&[Passage<'_>]]) -> Kept {
         let Some(revision) = off_the_runtime(|| memory_index::cached_revision(&self.models.dir))
         else {
-            return (Kept::default(), None);
+            return Kept::default();
         };
         // ponytail: holds every kept vector of these topics at once, so a
         // rebuild's peak follows the project here; page it by topic if that
         // matters.
-        let kept = self
-            .kept_vectors(revision, None, &digests(topics.iter().copied()))
-            .await;
-        let plan = kept.widest(topics.iter().copied()).map(str::to_string);
-        (kept, plan)
+        self.kept_vectors(revision, None, &digests(topics.iter().copied()))
+            .await
     }
 
     /// Keeps what passes embedded, so a rebuild or another node's catch-up
