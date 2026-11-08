@@ -25,10 +25,6 @@ pub enum StoreError {
     #[error("{0}")]
     OtherSettings(String),
 
-    /// An external database's role that row-level security would not bind.
-    #[error("{0}")]
-    Role(String),
-
     /// An external database that has not applied these migrations, which a
     /// deploy applies with [`crate::Database::migrate`].
     #[error(
