@@ -12,15 +12,15 @@
 -- still removes its rows. A later migration that rewrites a guarded table's
 -- rows has to lift the force around them; `migrate.rs` says how.
 
--- Every table V20 enabled it on, and no other.
 DO $$
 DECLARE
     guarded TEXT;
 BEGIN
-    FOR guarded IN
-        SELECT relname FROM pg_class
-         WHERE relnamespace = current_schema()::regnamespace AND relrowsecurity
-    LOOP
+    FOREACH guarded IN ARRAY ARRAY[
+        'sources', 'source_versions', 'source_spans', 'topics', 'topic_states',
+        'relationships', 'relationship_versions', 'topic_aliases',
+        'topic_name_tokens', 'file_records'
+    ] LOOP
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', guarded);
     END LOOP;
 END
