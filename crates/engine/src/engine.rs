@@ -1468,9 +1468,11 @@ impl Engine {
     /// length-sorted batching is *not* score-neutral and says so where it
     /// lives; that is a different model and a different code path.)
     ///
-    /// One model lock and one index lock for the whole batch rather than one
-    /// each per state, which is the other saving and the reason this is one
-    /// closure rather than a loop over states.
+    /// The model is locked twice for the whole batch, to check it and to
+    /// write it, rather than once per state, which is the other saving and
+    /// the reason this takes the batch rather than looping over states. Kept
+    /// vectors are looked up between the two, with no lock held, and the
+    /// index is locked per call ([`write_unheld`]).
     ///
     /// A state whose document the index already holds with exactly this text,
     /// embedded under the plan the model runs on now, is skipped before
