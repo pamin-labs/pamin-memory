@@ -6,6 +6,7 @@
 //! the work goes on as if nothing were kept.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 
 use memory_core::TopicId;
 use memory_index::{Embedder, SpanDocument, SpanSource, VectorCodes};
@@ -14,22 +15,29 @@ use memory_store::repository;
 use crate::engine::{Engine, off_the_runtime};
 
 /// What a span's vector is embedded from, with the hash it is kept under,
-/// taken once.
-#[derive(Clone, Copy, Debug)]
+/// taken once and only if asked for.
+#[derive(Clone, Debug)]
 pub(crate) struct Passage<'a> {
     pub(crate) text: &'a str,
-    /// The SHA-256 of `text`, so the same text finds its vector whichever
-    /// topic holds it.
-    pub(crate) digest: [u8; 32],
+    digest: OnceLock<[u8; 32]>,
 }
 
 impl<'a> Passage<'a> {
     pub(crate) fn of(text: &'a str) -> Self {
-        use sha2::Digest as _;
         Self {
             text,
-            digest: sha2::Sha256::digest(text.as_bytes()).into(),
+            digest: OnceLock::new(),
         }
+    }
+
+    /// The SHA-256 of the text, so the same text finds its vector whichever
+    /// topic holds it. Taken on first use: a span the index already holds is
+    /// never looked up or kept.
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        *self
+            .digest
+            .get_or_init(|| sha2::Sha256::digest(self.text.as_bytes()).into())
     }
 }
 
@@ -85,7 +93,7 @@ impl Kept {
                     topic,
                     passages
                         .iter()
-                        .map(|passage| &*kept[&passage.digest])
+                        .map(|passage| &*kept[&passage.digest()])
                         .collect(),
                 )),
                 None => to_embed.push(topic),
@@ -154,7 +162,7 @@ fn covers(kept: &HashMap<[u8; 32], Box<VectorCodes>>, passages: &[Passage<'_>]) 
     !passages.is_empty()
         && passages
             .iter()
-            .all(|passage| kept.contains_key(&passage.digest))
+            .all(|passage| kept.contains_key(&passage.digest()))
 }
 
 /// The hashes of every span of `topics`, to look up what is kept for them.
@@ -162,7 +170,7 @@ pub(crate) fn digests<'t>(topics: impl IntoIterator<Item = &'t [Passage<'t>]>) -
     topics
         .into_iter()
         .flatten()
-        .map(|passage| passage.digest)
+        .map(|passage| passage.digest())
         .collect()
 }
 
@@ -212,7 +220,7 @@ impl Embedded {
             vectors: passages
                 .into_iter()
                 .zip(vectors)
-                .map(|(passage, vector)| (passage.digest, memory_index::vector_to_bytes(vector)))
+                .map(|(passage, vector)| (passage.digest(), memory_index::vector_to_bytes(vector)))
                 .collect(),
         })
     }
@@ -370,14 +378,15 @@ mod tests {
             by_plan: [
                 (
                     "a".into(),
-                    [(x.digest, one.clone()), (y.digest, two.clone())].into(),
+                    [(x.digest(), one.clone()), (y.digest(), two.clone())].into(),
                 ),
-                ("b".into(), [(x.digest, three)].into()),
-                ("c".into(), [(y.digest, four)].into()),
+                ("b".into(), [(x.digest(), three)].into()),
+                ("c".into(), [(y.digest(), four)].into()),
             ]
             .into(),
         };
-        let topics: [(u8, &[Passage<'_>]); 4] = [(0, &[y, x]), (1, &[x]), (2, &[z]), (3, &[])];
+        let topics: [(u8, &[Passage<'_>]); 4] =
+            [(0, &[y, x.clone()]), (1, &[x]), (2, &[z]), (3, &[])];
         let (supplied, to_embed) = kept.split("model@1", Some("a"), topics);
         assert_eq!(supplied, [(0, vec![&*two, &*one]), (1, vec![&*one])]);
         assert_eq!(to_embed, [2], "an empty topic is in neither");

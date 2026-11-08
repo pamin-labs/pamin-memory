@@ -338,7 +338,7 @@ impl Indexed {
         spans.iter().map(Self::source).collect()
     }
 
-    /// What these spans' vectors are embedded from, each hashed once.
+    /// What these spans' vectors are embedded from ([`Passage`]).
     fn passages(spans: &[Self]) -> Vec<Passage<'_>> {
         spans
             .iter()
@@ -4912,7 +4912,7 @@ mod tests {
                     (pass.encoding.as_str(), hashes)
                 })
                 .collect::<Vec<_>>(),
-            [("cpu:fallback", vec![super::Passage::of("beta").digest])],
+            [("cpu:fallback", vec![super::Passage::of("beta").digest()])],
             "what the pass embedded is handed back to keep"
         );
         assert_eq!(
@@ -5185,7 +5185,7 @@ mod tests {
                 texts
                     .iter()
                     .map(|text| {
-                        let digest = super::Passage::of(text).digest;
+                        let digest = super::Passage::of(text).digest();
                         let bytes = memory_index::vector_to_bytes(&vector);
                         (
                             digest,
