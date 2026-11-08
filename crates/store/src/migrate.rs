@@ -152,12 +152,11 @@ fn migration(version: i64, description: &'static str, sql: &'static str) -> Migr
     // again, all inside the migration's transaction.
     //
     // `SET LOCAL`, inside the transaction `sqlx` applies each migration in
-    // (none is `no_tx`, which the test below holds),
-    // because a session setting is not safe behind a transaction-pooling
-    // proxy such as PgBouncer: the next transaction may run on another
-    // server connection, and this one goes back to whoever is next. The
-    // checksum stays the file's, computed above, so the history a database
-    // already recorded still matches.
+    // (none is `no_tx`, which the test below holds), because a session setting
+    // is not safe behind a transaction-pooling proxy such as PgBouncer: the
+    // next transaction may run on another server connection, and this one goes
+    // back to whoever is next. The checksum stays the file's, computed above,
+    // so the history a database already recorded still matches.
     migration.sql = AssertSqlSafe(format!("{ROW_SECURITY_OFF}{sql}")).into_sql_str();
     migration
 }
@@ -199,7 +198,6 @@ pub async fn run(pool: &PgPool) -> Result<Vec<i64>> {
     // owns startup for one workspace, and an external database is migrated once
     // per deploy ([`crate::Database::migrate`]), never by the servers on it.
     migrator.set_locking(false);
-
     migrator.run(pool).await?;
 
     Ok(pending)
