@@ -401,7 +401,9 @@ impl Session {
                 // Found by name, deleted by id: a project another server purged
                 // in between, and maybe made again, is looked up afresh.
                 let purged = loop {
-                    let Some(id) = repository::find_project(self.database.pool(), project).await?
+                    let Some(id) = repository::find_project(self.database.pool(), project)
+                        .await?
+                        .map(|found| found.id)
                     else {
                         break None;
                     };

@@ -78,45 +78,44 @@ sql_enum!(JobKind {
 /// autovacuum. `DO NOTHING` returns nothing on conflict, so the losing side of
 /// the race reads the winner's row instead.
 pub async fn ensure_project(pool: &PgPool, name: &str) -> Result<Project> {
-    const FIND: &str = "SELECT id, name, created_at FROM projects WHERE name = $1";
-
-    let row = match sqlx::query(FIND).bind(name).fetch_optional(pool).await? {
-        Some(row) => row,
-        None => {
-            let inserted = sqlx::query(
-                "INSERT INTO projects (id, name, created_at)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (name) DO NOTHING
-                 RETURNING id, name, created_at",
-            )
-            .bind(ProjectId::new().0)
-            .bind(name)
-            .bind(OffsetDateTime::now_utc())
-            .fetch_optional(pool)
-            .await?;
-
-            match inserted {
-                Some(row) => row,
-                // Another writer created it in between.
-                None => sqlx::query(FIND).bind(name).fetch_one(pool).await?,
-            }
-        }
-    };
-
-    Ok(Project {
-        id: row.get::<uuid::Uuid, _>("id").into(),
-        name: row.get("name"),
-        created_at: row.get("created_at"),
-    })
+    if let Some(project) = find_project(pool, name).await? {
+        return Ok(project);
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO projects (id, name, created_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (name) DO NOTHING
+         RETURNING id, name, created_at",
+    )
+    .bind(ProjectId::new().0)
+    .bind(name)
+    .bind(OffsetDateTime::now_utc())
+    .fetch_optional(pool)
+    .await?;
+    match inserted {
+        Some(row) => Ok(project_from(&row)),
+        // Another writer created it in between.
+        None => find_project(pool, name)
+            .await?
+            .ok_or_else(|| sqlx::Error::RowNotFound.into()),
+    }
 }
 
-/// The id of the project with this name, if there is one.
-pub async fn find_project(pool: &PgPool, name: &str) -> Result<Option<ProjectId>> {
-    let id: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM projects WHERE name = $1")
+/// The project with this name, if there is one.
+pub async fn find_project(pool: &PgPool, name: &str) -> Result<Option<Project>> {
+    let row = sqlx::query("SELECT id, name, created_at FROM projects WHERE name = $1")
         .bind(name)
         .fetch_optional(pool)
         .await?;
-    Ok(id.map(|(id,)| id.into()))
+    Ok(row.as_ref().map(project_from))
+}
+
+fn project_from(row: &sqlx::postgres::PgRow) -> Project {
+    Project {
+        id: row.get::<uuid::Uuid, _>("id").into(),
+        name: row.get("name"),
+        created_at: row.get("created_at"),
+    }
 }
 
 /// What [`purge_project`] deleted.
