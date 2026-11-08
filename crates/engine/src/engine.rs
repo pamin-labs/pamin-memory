@@ -5200,7 +5200,11 @@ mod tests {
                     .iter()
                     .map(|text| {
                         let digest = super::Passage::of(text).digest;
-                        (digest, memory_index::vector_to_bytes(&vector))
+                        let bytes = memory_index::vector_to_bytes(&vector);
+                        (
+                            digest,
+                            memory_index::vector_codes(&bytes).expect("a vector"),
+                        )
                     })
                     .collect(),
             )]

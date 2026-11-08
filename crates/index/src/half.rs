@@ -97,23 +97,29 @@ pub fn to_bytes(vector: &[f32]) -> Vec<u8> {
 }
 
 /// How many bytes [`to_bytes`] makes of one of this model's vectors.
-pub const VECTOR_BYTES: usize = 2 * crate::DIMENSIONS as usize;
+const VECTOR_BYTES: usize = 2 * crate::DIMENSIONS as usize;
 
-/// [`to_bytes`] widened back: the vector an index would have read back, or
-/// `None` for bytes that are not one of this model's vectors.
-pub fn from_bytes(bytes: &[u8]) -> Option<Vec<f32>> {
+/// One of this model's vectors as its fp16 codes.
+pub type Codes = [u16; crate::DIMENSIONS as usize];
+
+/// [`to_bytes`] read back, or `None` for bytes that are not one of this
+/// model's vectors: checked here, once, so [`widen`] cannot fail.
+pub fn from_bytes(bytes: &[u8]) -> Option<Box<Codes>> {
     if bytes.len() != VECTOR_BYTES {
         return None;
     }
-    let codes: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
+    let mut codes = Box::new([0; crate::DIMENSIONS as usize]);
+    for (code, pair) in codes.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *code = u16::from_le_bytes(*pair);
+    }
+    Some(codes)
+}
+
+/// `codes` widened: the vector an index would have read back.
+pub fn widen(codes: &Codes) -> Vec<f32> {
     let mut vector = vec![0.0; codes.len()];
-    pamin_runtime::kernels::f16::widen(&codes, &mut vector);
-    Some(vector)
+    pamin_runtime::kernels::f16::widen(codes, &mut vector);
+    vector
 }
 
 /// A query vector for an fp16 field: its codes, two to an `f32`.
@@ -142,7 +148,7 @@ pub(crate) fn query(vector: &[f32]) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{as_stored, encode, from_bytes, query, to_bytes};
+    use super::{as_stored, encode, from_bytes, query, to_bytes, widen};
 
     /// A packed query holds the codes, in order, in the bytes it hands over.
     #[test]
@@ -167,7 +173,8 @@ mod tests {
             .map(|at| at as f32 / 7.0 - 3.0)
             .collect();
         let bytes = to_bytes(&vector);
-        assert_eq!(from_bytes(&bytes), Some(as_stored(&vector)));
+        let codes = from_bytes(&bytes).expect("one of this model's vectors");
+        assert_eq!(widen(&codes), as_stored(&vector));
         assert_eq!(from_bytes(&bytes[2..]), None, "another width is not one");
     }
 }

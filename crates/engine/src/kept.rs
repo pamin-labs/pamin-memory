@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use memory_core::TopicId;
-use memory_index::{SpanDocument, SpanSource};
+use memory_index::{SpanDocument, SpanSource, VectorCodes};
 use memory_store::repository;
 
 use crate::engine::{Engine, off_the_runtime};
@@ -35,16 +35,16 @@ impl<'a> Passage<'a> {
 
 /// Topics written from kept vectors, each with its spans' fp16 bytes in
 /// order.
-pub(crate) type Supplied<'k, T> = Vec<(T, Vec<&'k [u8]>)>;
+pub(crate) type Supplied<'k, T> = Vec<(T, Vec<&'k VectorCodes>)>;
 
 /// Vectors one model revision embedded, by plan, then by passage hash.
 ///
-/// Held as the fp16 bytes they are kept as, half what they widen to, and
-/// widened a batch at a time as they are written ([`widen`]).
+/// Held as their fp16 codes, half what they widen to, and widened a batch at
+/// a time as they are written ([`widen`]).
 #[derive(Default)]
 pub(crate) struct Kept {
     pub(crate) revision: String,
-    pub(crate) by_plan: BTreeMap<String, HashMap<[u8; 32], Vec<u8>>>,
+    pub(crate) by_plan: BTreeMap<String, HashMap<[u8; 32], Box<VectorCodes>>>,
 }
 
 impl Kept {
@@ -74,7 +74,7 @@ impl Kept {
                     topic,
                     passages
                         .iter()
-                        .map(|passage| kept[&passage.digest].as_slice())
+                        .map(|passage| &*kept[&passage.digest])
                         .collect(),
                 )),
                 None => to_embed.push(topic),
@@ -101,7 +101,7 @@ impl Kept {
 
 /// Whether every one of a topic's spans, of which it has at least one, has a
 /// vector in `kept`.
-fn covers(kept: &HashMap<[u8; 32], Vec<u8>>, passages: &[Passage<'_>]) -> bool {
+fn covers(kept: &HashMap<[u8; 32], Box<VectorCodes>>, passages: &[Passage<'_>]) -> bool {
     !passages.is_empty()
         && passages
             .iter()
@@ -118,14 +118,11 @@ pub(crate) fn digests<'t>(topics: impl IntoIterator<Item = &'t [Passage<'t>]>) -
 }
 
 /// Supplied vectors widened back to what the index stores, in order.
-pub(crate) fn widen<T>(supplied: &[(T, Vec<&[u8]>)]) -> Vec<Vec<f32>> {
+pub(crate) fn widen<T>(supplied: &[(T, Vec<&VectorCodes>)]) -> Vec<Vec<f32>> {
     supplied
         .iter()
         .flat_map(|(_, vectors)| vectors)
-        .map(|bytes| {
-            memory_index::vector_from_bytes(bytes)
-                .expect("a kept vector's width is checked when it is read")
-        })
+        .map(|codes| memory_index::widen_vector(codes))
         .collect()
 }
 
@@ -220,18 +217,18 @@ impl Engine {
             }
         };
         for row in rows {
-            if row.vector.len() != memory_index::VECTOR_BYTES {
+            let Some(codes) = memory_index::vector_codes(&row.vector) else {
                 tracing::warn!(
                     encoding = row.encoding,
                     bytes = row.vector.len(),
                     "skipping a kept span vector of another width"
                 );
                 continue;
-            }
+            };
             kept.by_plan
                 .entry(row.encoding)
                 .or_default()
-                .insert(row.passage_hash, row.vector);
+                .insert(row.passage_hash, codes);
         }
         kept
     }
@@ -316,24 +313,23 @@ mod tests {
     #[test]
     fn a_topic_is_kept_whole_under_one_plan_or_embedded() {
         let [x, y, z] = ["x", "y", "z"].map(Passage::of);
+        let [one, two, three, four] =
+            [1, 2, 3, 4].map(|code| Box::new([code; memory_index::DIMENSIONS as usize]));
         let kept = Kept {
             revision: "model@1".into(),
             by_plan: [
                 (
                     "a".into(),
-                    [(x.digest, vec![1]), (y.digest, vec![2])].into(),
+                    [(x.digest, one.clone()), (y.digest, two.clone())].into(),
                 ),
-                ("b".into(), [(x.digest, vec![3])].into()),
-                ("c".into(), [(y.digest, vec![4])].into()),
+                ("b".into(), [(x.digest, three)].into()),
+                ("c".into(), [(y.digest, four)].into()),
             ]
             .into(),
         };
         let topics: [(u8, &[Passage<'_>]); 4] = [(0, &[y, x]), (1, &[x]), (2, &[z]), (3, &[])];
         let (supplied, to_embed) = kept.split("model@1", Some("a"), topics);
-        assert_eq!(
-            supplied,
-            [(0, vec![&[2u8][..], &[1][..]]), (1, vec![&[1][..]])]
-        );
+        assert_eq!(supplied, [(0, vec![&*two, &*one]), (1, vec![&*one])]);
         assert_eq!(to_embed, [2], "an empty topic is in neither");
         assert_eq!(kept.split("model@1", Some("b"), topics).1, [0, 2]);
         assert_eq!(
