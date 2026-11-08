@@ -1,8 +1,9 @@
 //! What recording a section of a file leaves in the ledger.
 //!
 //! Ignored by default: it provisions PostgreSQL. Only the reindex test and the
-//! rebuild-on-open test, in its lost-index case, load a model -- nothing else
-//! here drains the cascade -- so the rest run in seconds. Run with `cargo test -p memory-engine --test ingest -- --ignored`.
+//! rebuild-on-open test load a model -- nothing else here drains the cascade --
+//! so the rest run in seconds. Run with
+//! `cargo test -p memory-engine --test ingest -- --ignored`.
 //!
 //! A section differs from a manual memory in three ways, each of which is a
 //! cost or a leak if it goes wrong and none of which a search would show: an
@@ -397,7 +398,7 @@ async fn a_reindex_keeps_sections_out_of_the_name_index() {
 /// that answers nothing. An open that finds the index missing marks the one it
 /// creates the same way.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "provisions postgres"]
+#[ignore = "provisions postgres and downloads model weights"]
 async fn a_missing_or_unfinished_index_is_rebuilt_on_the_next_open() {
     let (engine, workspace, name, _scratch) = engine_in().await;
     engine
