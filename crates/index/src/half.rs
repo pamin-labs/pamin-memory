@@ -115,9 +115,8 @@ pub fn from_bytes(bytes: &[u8]) -> Option<Box<Codes>> {
     Some(codes)
 }
 
-/// `codes` widened into `vector`, one of this model's width: the vector an
-/// index would have read back.
-pub fn widen(codes: &Codes, vector: &mut [f32]) {
+/// `codes` widened into `vector`: the vector an index would have read back.
+pub fn widen(codes: &Codes, vector: &mut [f32; crate::DIMENSIONS as usize]) {
     pamin_runtime::kernels::f16::widen(codes, vector);
 }
 
@@ -173,9 +172,9 @@ mod tests {
             .collect();
         let bytes = to_bytes(&vector);
         let codes = from_bytes(&bytes).expect("one of this model's vectors");
-        let mut widened = vec![0.0; vector.len()];
+        let mut widened = [0.0; crate::DIMENSIONS as usize];
         widen(&codes, &mut widened);
-        assert_eq!(widened, as_stored(&vector));
+        assert_eq!(widened.as_slice(), as_stored(&vector));
         assert_eq!(from_bytes(&bytes[2..]), None, "another width is not one");
     }
 }
