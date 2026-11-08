@@ -275,7 +275,8 @@ async fn the_tables_owner_sees_nothing_outside_a_scoped_transaction(database: &D
             .await;
         // insufficient_privilege: the role owns the table, so row-level
         // security is the only denial these tables can raise today: none has
-        // a trigger, sequence or default that reaches another object.
+        // a trigger of its own, a sequence or a default that reaches another
+        // object.
         let refused = inserted
             .as_ref()
             .err()
