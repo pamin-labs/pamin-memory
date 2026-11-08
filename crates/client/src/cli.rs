@@ -609,11 +609,11 @@ mod tests {
     /// so is no flag or `config.toml` key.
     const READ: &[&str] = &[
         settings::DATABASE_URL,
-        HOME_ENV,
+        "PAMIN_MEMORY_HOME",
         "PAMIN_MEMORY_PROJECT",
         "PAMIN_MEMORY_VECTOR_INDEX",
         "PAMIN_MEMORY_DEVICE",
-        settings::MODELS_DIR_ENV,
+        "PAMIN_MEMORY_MODELS_DIR",
         "PAMIN_MEMORY_LOG",
     ];
 
