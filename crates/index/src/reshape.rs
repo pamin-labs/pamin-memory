@@ -73,8 +73,8 @@ fn sibling(live: &Path) -> PathBuf {
 /// Where the served index is moved while the copy takes its place.
 ///
 /// Not `.previous`, which a rebuild sets aside to lend its vectors from: a
-/// rebuild discards what it finds there, and the two have to be able to fail
-/// without either tidying away the other's index.
+/// rebuild lends from and then deletes what it finds there, and the two have
+/// to be able to fail without either tidying away the other's index.
 fn replaced(live: &Path) -> PathBuf {
     live.with_extension("replaced")
 }

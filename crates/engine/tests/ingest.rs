@@ -1,8 +1,8 @@
 //! What recording a section of a file leaves in the ledger.
 //!
-//! Ignored by default: it provisions PostgreSQL. Only the reindex test loads a
-//! model -- nothing else here drains the cascade -- so the rest run in
-//! seconds. Run with `cargo test -p memory-engine --test ingest -- --ignored`.
+//! Ignored by default: it provisions PostgreSQL. Only the reindex test and the
+//! rebuild-on-open test, in its lost-index case, load a model -- nothing else
+//! here drains the cascade -- so the rest run in seconds. Run with `cargo test -p memory-engine --test ingest -- --ignored`.
 //!
 //! A section differs from a manual memory in three ways, each of which is a
 //! cost or a leak if it goes wrong and none of which a search would show: an

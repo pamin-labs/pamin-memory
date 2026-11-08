@@ -1015,8 +1015,8 @@ impl Engine {
         // the index is missing or a rebuild stopped part way. Decided before
         // the open, which creates the directory, and only with the directory
         // in hand: a reshape running here may have it aside for a moment. A
-        // workspace on the shared layout is not, since only `reindex` moves it
-        // off that.
+        // workspace on the shared layout is not, since only the `reindex`
+        // command moves it off that.
         let unfinished = exclusive.is_some()
             && off_the_runtime(|| {
                 memory_index::Reshape::recover(&dir)?;
