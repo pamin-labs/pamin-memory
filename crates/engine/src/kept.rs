@@ -182,14 +182,20 @@ pub(crate) fn write_supplied<'a, T, E>(
     topic: impl Fn(&T) -> (TopicId, &'a [SpanSource<'a>]),
     write: impl FnOnce(&[SpanDocument<'_>]) -> Result<(), E>,
 ) -> Result<(), E> {
-    let vectors: Vec<Vec<f32>> = supplied
+    // One buffer for the batch rather than one per span.
+    let width = memory_index::DIMENSIONS as usize;
+    let spans = supplied.iter().map(|(_, codes)| codes.len()).sum::<usize>();
+    let mut vectors = vec![0.0; spans * width];
+    for (codes, vector) in supplied
         .iter()
-        .flat_map(|(_, vectors)| vectors)
-        .map(|codes| memory_index::widen_vector(codes))
-        .collect();
+        .flat_map(|(_, codes)| codes)
+        .zip(vectors.chunks_exact_mut(width))
+    {
+        memory_index::widen_vector(codes, vector);
+    }
     let documents = span_documents(
         supplied.iter().map(|(at, _)| topic(at)),
-        vectors.iter().map(Vec::as_slice),
+        vectors.chunks_exact(width),
     );
     write(&documents)
 }

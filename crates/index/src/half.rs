@@ -115,11 +115,10 @@ pub fn from_bytes(bytes: &[u8]) -> Option<Box<Codes>> {
     Some(codes)
 }
 
-/// `codes` widened: the vector an index would have read back.
-pub fn widen(codes: &Codes) -> Vec<f32> {
-    let mut vector = vec![0.0; codes.len()];
-    pamin_runtime::kernels::f16::widen(codes, &mut vector);
-    vector
+/// `codes` widened into `vector`, one of this model's width: the vector an
+/// index would have read back.
+pub fn widen(codes: &Codes, vector: &mut [f32]) {
+    pamin_runtime::kernels::f16::widen(codes, vector);
 }
 
 /// A query vector for an fp16 field: its codes, two to an `f32`.
@@ -174,7 +173,9 @@ mod tests {
             .collect();
         let bytes = to_bytes(&vector);
         let codes = from_bytes(&bytes).expect("one of this model's vectors");
-        assert_eq!(widen(&codes), as_stored(&vector));
+        let mut widened = vec![0.0; vector.len()];
+        widen(&codes, &mut widened);
+        assert_eq!(widened, as_stored(&vector));
         assert_eq!(from_bytes(&bytes[2..]), None, "another width is not one");
     }
 }
