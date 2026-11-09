@@ -15,13 +15,16 @@
 use std::borrow::Cow;
 
 use sqlx::PgPool;
-use sqlx::SqlStr;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
+use sqlx::{AssertSqlSafe, SqlSafeStr, SqlStr};
 
 use crate::error::Result;
 
 /// The table `refinery` recorded applied migrations in, before `sqlx`.
 const APPLIED_BY_REFINERY: &str = "refinery_schema_history";
+
+/// What every migration runs first; see [`migration`].
+const ROW_SECURITY_OFF: &str = "SET LOCAL row_security = off;\n";
 
 /// Every migration, oldest first.
 fn migrations() -> Vec<Migration> {
@@ -122,23 +125,54 @@ fn migrations() -> Vec<Migration> {
             "row_level_security",
             include_str!("../migrations/V20__row_level_security.sql"),
         ),
+        migration(
+            21,
+            "force_row_level_security",
+            include_str!("../migrations/V21__force_row_level_security.sql"),
+        ),
+        migration(
+            22,
+            "span_vectors",
+            include_str!("../migrations/V22__span_vectors.sql"),
+        ),
     ]
 }
 
 fn migration(version: i64, description: &'static str, sql: &'static str) -> Migration {
-    Migration::new(
+    let mut migration = Migration::new(
         version,
         Cow::Borrowed(description),
         MigrationType::Simple,
         SqlStr::from_static(sql),
         false,
-    )
+    );
+    // Row security off for each migration, so one that touches guarded rows
+    // as the tables' owner -- the hosted role, which V21 subjects to the
+    // policies -- fails on any statement a policy applies to, rather than
+    // matching no row and recording itself applied. A superuser, as a local
+    // workspace's connection is, skips the policies either way, so only hosted
+    // shows it. Running them as `pamin_memory_app` fails the same way, so a
+    // migration that rewrites guarded rows lifts the force around them instead:
+    // `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, the rewrite, then `FORCE`
+    // again, all inside the migration's transaction.
+    //
+    // `SET LOCAL`, inside the transaction `sqlx` applies each migration in
+    // (none is `no_tx`, which the test below holds), because a session setting
+    // is not safe behind a transaction-pooling proxy such as PgBouncer: the
+    // next transaction may run on another server connection, and this one goes
+    // back to whoever is next. The checksum stays the file's, computed above,
+    // so the history a database already recorded still matches.
+    migration.sql = AssertSqlSafe(format!("{ROW_SECURITY_OFF}{sql}")).into_sql_str();
+    migration
 }
 
-/// Applies every migration the database has not seen yet.
+/// Applies every migration the database has not seen yet, and returns their
+/// versions.
 ///
-/// Safe to call on every start: already-applied migrations are skipped.
-pub async fn run(pool: &PgPool) -> Result<()> {
+/// Already-applied migrations are skipped, so a workspace's own cluster runs
+/// this on every open; an external database runs it only from
+/// [`crate::Database::migrate`].
+pub async fn run(pool: &PgPool) -> Result<Vec<i64>> {
     let migrations = migrations();
     adopt_refinery_history(pool, &migrations).await?;
 
@@ -165,12 +199,29 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     // to migrate. Without it they still cannot both succeed: each migration is
     // applied in the same transaction that records it and the version column is
     // a primary key, so the loser fails rather than applying anything twice.
-    // That is the exposure this already had under `refinery`, and it goes away
-    // once a server owns startup.
+    // That is the exposure this already had under `refinery`. A resident server
+    // owns startup for one workspace, and an external database is migrated once
+    // per deploy ([`crate::Database::migrate`]), never by the servers on it.
     migrator.set_locking(false);
     migrator.run(pool).await?;
 
-    Ok(())
+    Ok(pending)
+}
+
+/// Refuses a database with migrations this release has not seen applied, as
+/// a server on an external database does: [`Database::migrate`] applies them
+/// once per deploy, before servers that need them start. A database a newer
+/// release has migrated further is current, since each migration adds only
+/// what its release needs. Versions alone are compared: `migrate` validates
+/// checksums when it runs.
+///
+/// [`Database::migrate`]: crate::Database::migrate
+pub async fn ensure_current(pool: &PgPool) -> Result<()> {
+    let pending = pending(pool, &migrations()).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    Err(crate::StoreError::Behind(pending))
 }
 
 /// The versions this database has not applied yet.
@@ -293,7 +344,8 @@ async fn table_exists(pool: &PgPool, name: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use sqlx::migrate::Migrator;
+    use sqlx::migrate::{Migration, Migrator};
+    use sqlx::{AssertSqlSafe, SqlSafeStr};
 
     /// Constructs that would strand us on a single PostgreSQL node.
     ///
@@ -401,5 +453,33 @@ mod tests {
             files,
             "a migration file exists that the runner never applies"
         );
+    }
+
+    #[test]
+    fn every_migration_turns_row_security_off_in_its_transaction_and_keeps_its_checksum() {
+        for migration in super::migrations() {
+            assert!(
+                !migration.no_tx,
+                "V{} runs outside a transaction, where SET LOCAL does nothing",
+                migration.version
+            );
+            let file = migration
+                .sql
+                .as_str()
+                .strip_prefix(super::ROW_SECURITY_OFF)
+                .unwrap_or_else(|| panic!("V{} runs with row security on", migration.version));
+            let unprefixed = Migration::new(
+                migration.version,
+                migration.description.clone(),
+                migration.migration_type,
+                AssertSqlSafe(file.to_owned()).into_sql_str(),
+                migration.no_tx,
+            );
+            assert_eq!(
+                migration.checksum, unprefixed.checksum,
+                "V{}'s recorded checksum would no longer match",
+                migration.version
+            );
+        }
     }
 }

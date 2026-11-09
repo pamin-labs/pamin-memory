@@ -45,6 +45,8 @@ default.
 | `--open-indexes <n>` | `open_indexes` | `16` | How many project indexes a server keeps open at once |
 | `--jit <true\|false>` | `jit` | `false` | Let PostgreSQL compile query expressions with LLVM |
 | `--postgres-dir <path>` | `postgres_dir` | unset | Use a PostgreSQL already on this machine instead of installing one |
+| `--database-connections <n>` | `database_connections` | the server's own pool size | The most connections the server opens to the server named by `PAMIN_MEMORY_DATABASE_URL`; the server refuses to start with it when that is not set. Every node sharing that server holds its own pool, so their caps together have to fit its connection limit |
+| none | none | unset | `PAMIN_MEMORY_DATABASE_URL`, read by the server alone: a `postgres://` URL of a PostgreSQL server to use instead of the workspace's own cluster, as a hosted deployment does. The server connects, and starts, installs and records nothing; it migrates nothing either, and refuses to start until `pamin-memory migrate` has applied this release's migrations; `--jit` and `--postgres-dir` do not apply. It is read when the server starts, and a running server is not checked against it. It carries credentials, so it is neither a flag nor a `config.toml` key, and it is never printed; empty or not UTF-8, it is refused. A role that is a superuser or has `BYPASSRLS`, or a `pamin_memory_app` made beforehand with either, skips row-level security; the server and `pamin-memory migrate` warn and run, and isolation between projects is then the operator's choice. Servers and `pamin-memory migrate` connect as the same role, which owns the tables it migrates and reads their migration history when a server starts. Owning the tables does not exempt it from row-level security, unless it skips it as above: a query on the guarded tables sees the rows of the one project it works for, and none when it works for no project. To migrate, it needs `CREATEROLE`, or the role `pamin_memory_app` made once beforehand and granted to it `WITH ADMIN OPTION`. A logical backup with `pg_dump` needs a separate role that skips row-level security, a superuser or `BYPASSRLS`: as this one it fails on the guarded tables. |
 | `--models-dir <path>` | `models_dir` | `pamin/models` in the platform's cache directory | Where models are downloaded, prepared and compiled. Also read from `PAMIN_MEMORY_MODELS_DIR` |
 
 ```toml
@@ -312,8 +314,8 @@ outside the vector graph before it is built. They are fixed where they were
 measured; the evaluation harnesses set them as `PAMIN_MEMORY_EVAL_*` variables, which
 `pamin-memory` itself never reads. `pamin-memory search` has two hidden flags of the same
 kind; see [`pamin-memory search`](#pamin-memory-search). The only variables `pamin-memory` reads are
-`PAMIN_MEMORY_HOME`, `PAMIN_MEMORY_PROJECT`, `PAMIN_MEMORY_VECTOR_INDEX`, `PAMIN_MEMORY_DEVICE` and
-`PAMIN_MEMORY_LOG`; the ones that used to configure anything else are refused, as
+`PAMIN_MEMORY_HOME`, `PAMIN_MEMORY_PROJECT`, `PAMIN_MEMORY_VECTOR_INDEX`, `PAMIN_MEMORY_DEVICE`,
+`PAMIN_MEMORY_MODELS_DIR`, `PAMIN_MEMORY_LOG` and the server's `PAMIN_MEMORY_DATABASE_URL`; the ones that used to configure anything else are refused, as
 [Upgrading from settings variables](#upgrading-from-settings-variables)
 lists, and a unit test checks this page against what the binary reads.
 
@@ -1613,8 +1615,10 @@ retrieval engine replaceable and makes a breaking engine upgrade a rebuild
 rather than a migration. Relationships are unaffected: they live in the
 authority store, not the index.
 
-Run it after changing `--vector-index`, on a project indexed under a retired
-profile, or after deleting the index directory. It is also how an index built
+Run it after changing `--vector-index`, or on a project indexed under a
+retired profile. A project whose index directory is missing while PostgreSQL
+holds its memories, or whose rebuild stopped part way, is rebuilt by the server
+the first time it is used; that first call waits for the rebuild. It is also how an index built
 before [spans](#long-memories-spans), one document per memory, is cut into
 them: an index keeps the grain it was built with, and a rebuild uses the
 current one. It rebuilds one project — the one named by `--project` — and
@@ -1630,6 +1634,12 @@ index is recreated. Rebuilding recomputes it from what the project holds now,
 so a project that has outgrown its layout searches faster afterwards. Where the
 old index was built the way a new one is, a memory whose text has not changed
 keeps the vector it already has rather than being embedded again.
+Without an old index to take them from, a rebuild takes the vectors
+PostgreSQL keeps for each memory's text, embedded by the same model, so a
+project whose index was lost is not embedded again. When every vector it needs
+is kept, it loads no model and takes them under whichever plan covers the most
+memories, which can be one another machine ran; when it has to load the model
+for the rest, it takes only those kept under the plan the model runs here.
 
 The server does this on its own. Once a project's index is spread over
 more than twice the segments it should be, the server copies it into the right
@@ -1865,6 +1875,25 @@ Stopped the local database server
 Stops the local PostgreSQL, and the resident server if one is up. It is not run
 automatically, because the common case is an agent issuing many commands in a
 row and paying startup once.
+
+## `pamin-memory migrate`
+
+```console
+$ PAMIN_MEMORY_DATABASE_URL=postgres://… pamin-memory migrate
+Applied migrations [21, 22]
+```
+
+Applies this release's schema migrations to the PostgreSQL server named by
+`PAMIN_MEMORY_DATABASE_URL`, and does nothing else. A hosted deployment runs it
+once per deploy, before starting the servers that need the new schema: servers
+on that database never migrate it, so none races another to, and a server
+started on a database it has not migrated refuses to start, saying to run this.
+Each migration adds only what its release needs, so servers still running the
+release before keep working while the new ones start. Run one at a time: two at
+once never both apply a migration, but the loser fails. It refuses to run
+without the variable, since a workspace's own cluster migrates when it opens,
+and needs no workspace. With `--json` it prints the versions it applied,
+`{"applied":[21,22]}`, or an empty list when the database was already current.
 
 ## Notes for agents
 

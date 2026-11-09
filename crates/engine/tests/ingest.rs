@@ -1,8 +1,9 @@
 //! What recording a section of a file leaves in the ledger.
 //!
-//! Ignored by default: it provisions PostgreSQL. Only the reindex test loads a
-//! model -- nothing else here drains the cascade -- so the rest run in
-//! seconds. Run with `cargo test -p memory-engine --test ingest -- --ignored`.
+//! Ignored by default: it provisions PostgreSQL. Only the reindex test and the
+//! rebuild-on-open test load a model -- nothing else here drains the cascade --
+//! so the rest run in seconds. Run with
+//! `cargo test -p memory-engine --test ingest -- --ignored`.
 //!
 //! A section differs from a manual memory in three ways, each of which is a
 //! cost or a leak if it goes wrong and none of which a search would show: an
@@ -25,6 +26,7 @@ fn settings() -> memory_engine::Settings {
         store: memory_store::StoreSettings {
             jit: support::eval::switch("PAMIN_MEMORY_EVAL_JIT").unwrap_or_default(),
             postgres_dir: support::eval::path("PAMIN_MEMORY_EVAL_POSTGRES_DIR"),
+            external: None,
         },
         ..memory_engine::Settings::default()
     }
@@ -33,6 +35,13 @@ fn settings() -> memory_engine::Settings {
 /// A fresh project, in `PAMIN_MEMORY_EVAL_HOME`'s workspace when it is set -- where
 /// the model a reindex loads is already downloaded -- or in a scratch one.
 async fn engine() -> (Engine, Option<tempfile::TempDir>) {
+    let (engine, _, _, scratch) = engine_in().await;
+    (engine, scratch)
+}
+
+/// [`engine`], with the workspace and the project's name, for a test that
+/// opens the project again.
+async fn engine_in() -> (Engine, Workspace, String, Option<tempfile::TempDir>) {
     let home = std::env::var("PAMIN_MEMORY_EVAL_HOME").ok();
     let scratch = home
         .is_none()
@@ -58,7 +67,7 @@ async fn engine() -> (Engine, Option<tempfile::TempDir>) {
     )
     .await
     .expect("open the engine");
-    (engine, scratch)
+    (engine, workspace, name, scratch)
 }
 
 async fn count(engine: &Engine, sql: &'static str) -> i64 {
@@ -343,7 +352,7 @@ async fn a_sections_source_is_the_files() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provisions postgres and downloads model weights"]
 async fn a_reindex_keeps_sections_out_of_the_name_index() {
-    let (engine, _scratch) = engine().await;
+    let (engine, workspace, name, _scratch) = engine_in().await;
 
     engine
         .remember_section(SECTION, TEXT, Validity::ALWAYS, ROOT)
@@ -360,7 +369,17 @@ async fn a_reindex_keeps_sections_out_of_the_name_index() {
         .await
         .expect("empty the name index");
 
-    let rebuilt = engine.reindex().await.expect("reindex");
+    let database = engine.database.clone();
+    drop(engine);
+    let (engine, rebuilt) = Engine::rebuilt_attached(
+        database,
+        &memory_engine::Models::new(settings()),
+        &workspace,
+        &name,
+        VectorIndex::default(),
+    )
+    .await
+    .expect("reindex");
     assert_eq!(rebuilt.indexed, 2, "both memories are in the projection");
     assert_eq!(rebuilt.names, 1);
     assert_eq!(
@@ -370,6 +389,86 @@ async fn a_reindex_keeps_sections_out_of_the_name_index() {
         )
         .await,
         1
+    );
+}
+
+/// A rebuild marks its index unfinished before it opens the empty one, so a
+/// rebuild stopped right after setting the old index aside, before it indexed
+/// anything, is rebuilt on the next open rather than taken for a whole index
+/// that answers nothing. An open that finds the index missing marks the one it
+/// creates the same way.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "provisions postgres and downloads model weights"]
+async fn a_missing_or_unfinished_index_is_rebuilt_on_the_next_open() {
+    let (engine, workspace, name, _scratch) = engine_in().await;
+    engine
+        .remember("rollback_plan", TEXT, Validity::ALWAYS)
+        .await
+        .expect("manual write");
+    let database = engine.database.clone();
+    let dir = workspace.index_dir(engine.project);
+    drop(engine);
+
+    let open = async || {
+        Engine::open(
+            &workspace,
+            &name,
+            VectorIndex::default(),
+            Access::ReadWrite,
+            &settings(),
+        )
+        .await
+        .expect("open the engine")
+    };
+    let models = memory_engine::Models::new(settings());
+    let attached = async || {
+        Engine::attached(
+            database.clone(),
+            &models,
+            &workspace,
+            &name,
+            VectorIndex::default(),
+            Access::ReadWrite,
+        )
+        .await
+        .expect("open, rebuilding if unfinished")
+    };
+
+    // Stopped before `reindex`: the old index is aside and the new one empty.
+    drop(
+        Engine::rebuilding_attached(
+            database.clone(),
+            &models,
+            &workspace,
+            &name,
+            VectorIndex::default(),
+        )
+        .await
+        .expect("start a rebuild"),
+    );
+    drop(open().await);
+    assert!(
+        Engine::rebuild_unfinished(&dir),
+        "a rebuild stopped after setting the index aside was taken for finished"
+    );
+    drop(attached().await);
+    assert!(
+        !Engine::rebuild_unfinished(&dir),
+        "an open left an unfinished index unrebuilt"
+    );
+
+    // A missing index: an open that does not rebuild leaves the one it
+    // creates marked, and the next one that does rebuilds it.
+    std::fs::remove_dir_all(&dir).expect("lose the index");
+    drop(open().await);
+    assert!(
+        Engine::rebuild_unfinished(&dir),
+        "a missing index was taken for empty"
+    );
+    drop(attached().await);
+    assert!(
+        !Engine::rebuild_unfinished(&dir),
+        "an open left an unfinished index unrebuilt"
     );
 }
 

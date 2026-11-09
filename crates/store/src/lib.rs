@@ -13,7 +13,10 @@ pub mod repository;
 mod sql;
 pub mod workspace;
 
-pub use database::{Connections, Database, StoreSettings, installation_missing};
+pub use database::{
+    Connections, Database, DatabaseUrl, External, POSTGRES_VERSION, StoreSettings,
+    installation_missing,
+};
 pub use error::{Result, StoreError};
 /// One connection, for a caller that asks several statements in a row and
 /// would otherwise take a connection from the pool and return it for each.

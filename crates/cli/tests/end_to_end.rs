@@ -14,6 +14,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use memory_client::cli::HOME_ENV;
 use serde_json::Value;
 
 struct Cli {
@@ -42,7 +43,7 @@ impl Cli {
     fn run(&self, args: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(args)
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .output()
             .expect("running pamin-memory");
 
@@ -86,7 +87,7 @@ impl Cli {
         let child = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(["serve"])
             .args(flags)
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .env("PAMIN_MEMORY_LOG", filter)
             .stdout(log.try_clone().expect("a second handle on the log"))
             .stderr(log)
@@ -111,7 +112,7 @@ impl Cli {
     fn fails(&self, args: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(args)
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .output()
             .expect("running pamin-memory");
         assert!(!output.status.success(), "expected {args:?} to fail");
@@ -124,7 +125,7 @@ impl Drop for Cli {
         // Leaves no server behind for the next test to collide with.
         let _ = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(["stop"])
-            .env("PAMIN_MEMORY_HOME", self.home())
+            .env(HOME_ENV, self.home())
             .output();
     }
 }
@@ -1122,8 +1123,8 @@ fn the_index_rebuilds_from_postgres(cli: &Cli) {
     let rebuilt = cli.json(&["reindex"]);
     assert!(rebuilt["indexed"].as_u64().unwrap_or(0) >= MEMORIES.len() as u64);
     assert_eq!(
-        rebuilt["reused"], 0,
-        "with the index deleted there is nothing to reuse: {rebuilt}"
+        rebuilt["reused"], rebuilt["indexed"],
+        "with the index deleted every vector comes back from postgres: {rebuilt}"
     );
 
     let after = contents(&cli.json(&["search", "流水线", "--limit", "1"]));
@@ -1161,7 +1162,7 @@ fn a_removed_setting_is_refused_rather_than_ignored() {
         for value in values {
             let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
                 .args(["read", "deploy"])
-                .env("PAMIN_MEMORY_HOME", home.path())
+                .env(HOME_ENV, home.path())
                 .env(name, value)
                 .output()
                 .expect("running pamin-memory");
@@ -1205,7 +1206,7 @@ fn a_walk_deeper_than_the_graph_channel_goes_is_refused() {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
             .args(args)
-            .env("PAMIN_MEMORY_HOME", home.path())
+            .env(HOME_ENV, home.path())
             .output()
             .expect("running pamin-memory");
 
@@ -2290,7 +2291,7 @@ fn an_import_records_the_whole_file_or_none_of_it() {
     let refused = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
         .args(["import", "--from"])
         .arg(&broken)
-        .env("PAMIN_MEMORY_HOME", cli.home())
+        .env(HOME_ENV, cli.home())
         .output()
         .expect("running import");
     assert!(
@@ -2515,7 +2516,7 @@ fn an_ingested_file_is_found_by_section_and_re_ingested_by_change() {
     let relative = Command::new(env!("CARGO_BIN_EXE_pamin-memory"))
         .args(["ingest", "--no-sync", "docs", "--json"])
         .current_dir(tree.path())
-        .env("PAMIN_MEMORY_HOME", cli.home())
+        .env(HOME_ENV, cli.home())
         .output()
         .expect("running ingest");
     assert!(relative.status.success(), "{relative:?}");
@@ -3092,4 +3093,76 @@ fn an_ingested_tree_is_kept_in_sync_without_ingesting_again() {
 
     server.kill().expect("stopping the server");
     server.wait().expect("reaping the server");
+}
+
+/// A server that finds a project's index gone, or half rebuilt, answers from
+/// PostgreSQL anyway.
+///
+/// The index is derived from the ledger, so it can be lost while the memories
+/// are not: a disk replaced, or restored from a copy without this project.
+/// Without the rebuild, a fresh server opens an empty index and every search
+/// answers nothing until someone runs `reindex`.
+#[test]
+#[ignore = "provisions postgres and downloads model weights"]
+fn a_server_without_its_index_rebuilds_it_on_first_use() {
+    const QUERY: &str = "when do the rocket skates launch";
+    const MEMORY: &str = "fourteenth of november";
+    let cli = Cli::new();
+    let server = cli.serve();
+    cli.run(&["init"]);
+    cli.run(&[
+        "write",
+        "--topic",
+        "launch_date",
+        "the rocket skates launch on the fourteenth of november",
+    ]);
+    stop(server, &cli);
+
+    let indexes = cli.home().join("index");
+    std::fs::remove_dir_all(&indexes).expect("delete the index");
+
+    let server = cli.serve();
+    let found = contents(&cli.json(&["search", QUERY, "--limit", "1"]));
+    assert!(
+        found.iter().any(|content| content.contains(MEMORY)),
+        "a memory postgres holds was not found after the index was lost: {found:?}"
+    );
+    stop(server, &cli);
+
+    // A rebuild killed part way: the directory is there, empty but for the
+    // marker the rebuild leaves until it finishes.
+    let project = std::fs::read_dir(&indexes)
+        .expect("the rebuilt index")
+        .flatten()
+        .map(|entry| entry.path())
+        // Not the copy a rebuild sets aside, `<project>.previous`.
+        .find(|path| path.is_dir() && path.extension().is_none())
+        .expect("the project's index directory");
+    std::fs::remove_dir_all(&project).expect("empty the index");
+    std::fs::create_dir(&project).expect("the directory again");
+    std::fs::write(project.join(memory_engine::Engine::UNFINISHED_REBUILD), b"")
+        .expect("the marker");
+
+    let server = cli.serve();
+    let found = contents(&cli.json(&["search", QUERY, "--limit", "1"]));
+    assert!(
+        found.iter().any(|content| content.contains(MEMORY)),
+        "an unfinished rebuild was not finished on first use: {found:?}"
+    );
+    assert!(
+        !memory_engine::Engine::rebuild_unfinished(&project),
+        "a finished rebuild removes its marker"
+    );
+    stop(server, &cli);
+}
+
+/// Kills a server and removes the socket it leaves, so the next `serve` waits
+/// for its own server instead of finding the old socket and returning at once,
+/// and no client starts an untracked server of its own meanwhile.
+fn stop(mut server: std::process::Child, cli: &Cli) {
+    server.kill().expect("stopping the server");
+    server.wait().expect("reaping the server");
+    let _ = std::fs::remove_file(memory_client::protocol::socket_path(
+        &memory_core::Workspace::at(cli.home()),
+    ));
 }

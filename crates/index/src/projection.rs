@@ -134,6 +134,13 @@ pub struct SpanSource<'a> {
     pub header: &'a str,
 }
 
+impl<'a> SpanSource<'a> {
+    /// This span as span `ordinal` of `topic` is written, with `vector`.
+    pub fn document(self, topic: TopicId, ordinal: u32, vector: &'a [f32]) -> SpanDocument<'a> {
+        (topic, ordinal, self.text, Some(self.header), vector)
+    }
+}
+
 /// What the layer above needs a projection to do.
 ///
 /// The architecture decision that chose this engine mitigated its pre-1.0 risk
@@ -1751,22 +1758,28 @@ pub struct Previous {
 impl Previous {
     /// Moves the index in `dir` aside and opens it to lend its vectors.
     ///
-    /// `None`, with the directory discarded, when there is no index or when
-    /// its vectors were computed some other way than an index built now would
-    /// compute them. A directory left aside by a rebuild that did not finish is
-    /// discarded first: what is in `dir` is then that rebuild's partial output
-    /// or its finished one, and the ledger reproduces either.
+    /// An index already aside is kept instead, with `dir` discarded: one is
+    /// left only by a rebuild that did not finish, which discards it once
+    /// it has indexed everything, so it is the whole index from before that
+    /// rebuild and `dir` that rebuild's partial output. Lending from `dir`
+    /// would embed again everything the partial output had not reached.
+    ///
+    /// `None`, with both discarded, when there is no index or when its vectors
+    /// were computed some other way than an index built now would compute them.
     pub fn set_aside(dir: &Path) -> Result<Option<Self>> {
         let aside = dir.with_extension("previous");
-        ProjectionIndex::discard(&aside)?;
+        if std::fs::exists(&aside)? {
+            ProjectionIndex::discard(dir)?;
+        } else if std::fs::exists(dir)? {
+            std::fs::rename(dir, &aside)?;
+        }
         let current = Marker::current(VectorIndex::default(), Grain::default());
-        let Some(recorded) = Marker::read(dir)?.filter(|recorded| {
+        let Some(recorded) = Marker::read(&aside)?.filter(|recorded| {
             recorded.matches(&current) && Grain::parse(&recorded.grain).is_some()
         }) else {
-            ProjectionIndex::discard(dir)?;
+            ProjectionIndex::discard(&aside)?;
             return Ok(None);
         };
-        std::fs::rename(dir, &aside)?;
         // The collection exists, so the vector index passed here only fills a
         // schema the engine does not read.
         let mut index = ProjectionIndex::open_with_dimensions(
@@ -1786,20 +1799,12 @@ impl Previous {
         }))
     }
 
-    /// How many of these topics [`lend`](Self::lend) would supply, without
-    /// reading a vector.
-    ///
-    /// `wanted` maps each topic to the spans the rebuild will write for it,
-    /// in order.
-    pub fn lends(&self, wanted: &HashMap<TopicId, Vec<SpanSource<'_>>>) -> Result<usize> {
-        Ok(self.whole(wanted)?.len())
-    }
-
-    /// Hands `take` every document this index can lend, at most `batch` at a
-    /// time, as the span, the text wanted for it, the header its vector was
-    /// recorded under ([`Stored::header`]) and its stored vector, with what
-    /// produced those vectors ([`Stored::encoding`]); returns the topics it
-    /// lent, every span of each.
+    /// Hands `take` every document of the topics `lent` names, at most
+    /// `batch` at a time, as the span, the text wanted for it, the header its
+    /// vector was recorded under ([`Stored::header`]) and its stored vector,
+    /// with what produced those vectors ([`Stored::encoding`]). `lent` is what
+    /// [`lends`](Self::lends) answered for `wanted`, so the caller decides
+    /// what else to supply before this pass and the pass is not run twice.
     ///
     /// Each batch shares one encoding, so the caller can record it as this
     /// index did: a rebuild that dropped it would leave every lent document
@@ -1809,23 +1814,22 @@ impl Previous {
     /// vectors at once. So whenever `batch` documents are waiting in all,
     /// every encoding's are handed over.
     ///
-    /// A topic is lent when this index holds it with exactly the spans in
-    /// `wanted` (see [`holds_spans`]); everything else is the caller's to
-    /// embed, and nothing of it is lent. The documents are written with
-    /// [`Projection::write_spans`], so a topic whose spans arrive in two
-    /// batches is not cut short by the first. In the order this
-    /// index holds its documents rather than the caller's, because that is
-    /// the order they are read in: one pass over the collection rather than a
-    /// keyed fetch per batch. Over MIRACL's 131,924 documents a pass takes
-    /// 0.28 s this way against 1.46-1.59 s of keyed fetches, with the same
-    /// resident set and identical vectors and text (ADR 0001).
+    /// Everything else is the caller's to supply, and nothing of it is lent.
+    /// The documents are written with [`Projection::write_spans`], so a topic
+    /// whose spans arrive in two batches is not cut short by the first. In
+    /// the order this index holds its documents rather than the caller's,
+    /// because that is the order they are read in: one pass over the
+    /// collection rather than a keyed fetch per batch. Over MIRACL's 131,924
+    /// documents a pass takes 0.28 s this way against 1.46-1.59 s of keyed
+    /// fetches, with the same resident set and identical vectors and text
+    /// (ADR 0001).
     pub fn lend(
         &self,
         wanted: &HashMap<TopicId, Vec<SpanSource<'_>>>,
+        lent: &HashSet<TopicId>,
         batch: usize,
         mut take: impl FnMut(&[SpanDocument<'_>], Option<&str>) -> Result<()>,
-    ) -> Result<HashSet<TopicId>> {
-        let lent = self.whole(wanted)?;
+    ) -> Result<()> {
         let mut pending: BTreeMap<Option<String>, Vec<PendingSpanDocument<'_>>> = BTreeMap::new();
         let mut waiting = 0;
         let mut hand_over =
@@ -1889,16 +1893,21 @@ impl Previous {
                 hand_over(encoding, group)?;
             }
         }
-        Ok(lent)
+        Ok(())
     }
 
-    /// The topics of `wanted` this index holds with exactly the spans given
-    /// for them: every one, each with its text, and none past them.
+    /// The topics of `wanted` [`lend`](Self::lend) would supply, without
+    /// reading a vector: those this index holds with exactly the spans given
+    /// for them, every one, each with its text, and none past them. `wanted`
+    /// maps each topic to the spans the rebuild will write for it, in order.
     ///
     /// A pass of its own, without vectors, before any is lent: a topic is
     /// lent whole or not at all, and whether it is whole is known only once
     /// every document has been seen.
-    fn whole(&self, wanted: &HashMap<TopicId, Vec<SpanSource<'_>>>) -> Result<HashSet<TopicId>> {
+    pub fn lends(
+        &self,
+        wanted: &HashMap<TopicId, Vec<SpanSource<'_>>>,
+    ) -> Result<HashSet<TopicId>> {
         let mut matched: HashMap<TopicId, usize> = HashMap::new();
         let mut spoiled: HashSet<TopicId> = HashSet::new();
         self.each(false, |(topic, ordinal), doc| {
@@ -1958,10 +1967,16 @@ impl Previous {
     }
 
     /// Deletes the set-aside index, once the rebuild no longer needs it.
+    ///
+    /// Renamed first, so a stop part way through the delete never leaves part
+    /// of an index under the name [`set_aside`](Self::set_aside) keeps.
     pub fn discard(self) -> Result<()> {
         let Self { index, dir, .. } = self;
         drop(index);
-        ProjectionIndex::discard(&dir)
+        let gone = dir.with_extension("discarded");
+        ProjectionIndex::discard(&gone)?;
+        std::fs::rename(&dir, &gone)?;
+        ProjectionIndex::discard(&gone)
     }
 }
 

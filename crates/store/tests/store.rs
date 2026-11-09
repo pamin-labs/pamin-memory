@@ -94,11 +94,122 @@ async fn the_ledger_holds_its_promises() {
     a_promoted_write_is_one_statement_after_its_locks(&database).await;
     an_edge_reads_the_same_direction_from_either_end(&database).await;
     a_version_is_numbered_and_read_from_its_own_key(&database, &workspace).await;
+    a_span_vector_is_kept_once_and_for_its_project_alone(&database).await;
     a_scoped_transaction_reaches_only_its_project(&database).await;
+    the_tables_owner_sees_nothing_outside_a_scoped_transaction(&database).await;
     purging_a_project_leaves_none_of_its_rows(&database).await;
 
     drop(database);
     a_stopped_server_is_started_again_without_waiting(&workspace).await;
+}
+
+/// A span vector is kept once per model, text and plan, read back under
+/// every plan of the model asked for, out of another project's reach, and
+/// purged with its project.
+async fn a_span_vector_is_kept_once_and_for_its_project_alone(database: &Database) {
+    let mine = repository::ensure_project(database.pool(), "span-vectors-mine")
+        .await
+        .expect("project")
+        .id;
+    let theirs = repository::ensure_project(database.pool(), "span-vectors-theirs")
+        .await
+        .expect("project")
+        .id;
+    let hashes = [[1u8; 32], [2u8; 32]];
+    let vectors = [([1u8; 32], vec![10u8, 0]), ([2u8; 32], vec![20u8, 0])];
+    for (project, revision, encoding) in [
+        (mine, "model@1", "cpu:a"),
+        (mine, "model@1", "cpu:a"),
+        (mine, "model@1", "npu:b"),
+        (mine, "model@2", "cpu:a"),
+        (theirs, "model@1", "cpu:a"),
+    ] {
+        let mut scoped = database.scoped(project).await.expect("scoped");
+        repository::put_span_vectors(&mut scoped, project, revision, encoding, &vectors)
+            .await
+            .expect("keep vectors");
+        scoped.commit().await.expect("commit");
+    }
+
+    let mut scoped = database.scoped(mine).await.expect("scoped");
+    let mut kept = repository::span_vectors(&mut *scoped, mine, "model@1", None, &hashes[..1])
+        .await
+        .expect("read vectors");
+    kept.sort_by(|left, right| left.encoding.cmp(&right.encoding));
+    assert_eq!(
+        kept.iter()
+            .map(|kept| (kept.encoding.as_str(), kept.vector.as_slice()))
+            .collect::<Vec<_>>(),
+        [("cpu:a", &[10u8, 0][..]), ("npu:b", &[10u8, 0][..])],
+        "one row per plan of the model asked for, however often it was kept"
+    );
+    assert_eq!(
+        repository::span_vectors(&mut *scoped, mine, "model@1", Some("npu:b"), &hashes)
+            .await
+            .expect("read one plan")
+            .len(),
+        2,
+        "asked for one plan, only its rows"
+    );
+    assert!(
+        repository::span_vectors(&mut *scoped, theirs, "model@1", None, &hashes)
+            .await
+            .expect("read theirs")
+            .is_empty(),
+        "another project's vectors are out of reach, whatever the query names"
+    );
+    // A row of another width is put right; one of the same width stays.
+    for vector in [vec![10u8, 0, 0, 0], vec![99, 0, 0, 0]] {
+        repository::put_span_vectors(&mut scoped, mine, "model@1", "cpu:a", &[([1; 32], vector)])
+            .await
+            .expect("keep it again");
+    }
+    let rekept = repository::span_vectors(&mut *scoped, mine, "model@1", Some("cpu:a"), &hashes)
+        .await
+        .expect("read it back");
+    assert_eq!(
+        rekept
+            .iter()
+            .find(|kept| kept.passage_hash == [1; 32])
+            .map(|kept| kept.vector.as_slice()),
+        Some(&[10u8, 0, 0, 0][..]),
+        "the wrong width is replaced and the right one kept"
+    );
+    let odd = [([3; 32], vec![1])];
+    let malformed = repository::put_span_vectors(&mut scoped, mine, "model@1", "x", &odd).await;
+    assert!(malformed.is_err(), "an odd-width vector is refused");
+    drop(scoped);
+    let mut scoped = database.scoped(mine).await.expect("scoped");
+    let many: Vec<([u8; 32], Vec<u8>)> = (0..2 * repository::PUT_SPAN_VECTORS_BATCH as u32 + 1)
+        .map(|at| {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&at.to_le_bytes());
+            (hash, vec![1, 0])
+        })
+        .collect();
+    repository::put_span_vectors(&mut scoped, mine, "model@3", "cpu:a", &many)
+        .await
+        .expect("keep more than one statement's worth");
+    let many_hashes: Vec<[u8; 32]> = many.iter().map(|(hash, _)| *hash).collect();
+    assert_eq!(
+        repository::span_vectors(&mut *scoped, mine, "model@3", None, &many_hashes)
+            .await
+            .expect("read them back")
+            .len(),
+        many.len(),
+        "every row is kept, however many statements it takes"
+    );
+    repository::purge_project(&mut *scoped, mine)
+        .await
+        .expect("purge")
+        .expect("the project existed");
+    scoped.commit().await.expect("commit the purge");
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM span_vectors WHERE project_id = $1")
+        .bind(mine.0)
+        .fetch_one(database.pool())
+        .await
+        .expect("count");
+    assert_eq!(left, 0, "a purged project's vectors go with it");
 }
 
 /// Inside a scoped transaction the guarded tables hold one project's rows.
@@ -109,15 +220,7 @@ async fn the_ledger_holds_its_promises() {
 /// nothing at all as the guarded role with no project named. Late in the run,
 /// so the checks above have filled several projects.
 async fn a_scoped_transaction_reaches_only_its_project(database: &Database) {
-    let guarded: Vec<(String,)> = sqlx::query_as(
-        "SELECT relname::text FROM pg_class
-          WHERE relnamespace = current_schema()::regnamespace AND relrowsecurity
-          ORDER BY relname",
-    )
-    .fetch_all(database.pool())
-    .await
-    .expect("list the guarded tables");
-    let guarded: Vec<String> = guarded.into_iter().map(|(table,)| table).collect();
+    let guarded = guarded_tables(database).await;
     assert_eq!(
         guarded,
         [
@@ -127,6 +230,7 @@ async fn a_scoped_transaction_reaches_only_its_project(database: &Database) {
             "source_spans",
             "source_versions",
             "sources",
+            "span_vectors",
             "topic_aliases",
             "topic_name_tokens",
             "topic_states",
@@ -205,6 +309,105 @@ async fn a_scoped_transaction_reaches_only_its_project(database: &Database) {
         .expect("roll back");
 }
 
+/// The tables row-level security guards, by name, having checked it is
+/// forced on each: listed by enabled alone, so an unforced one fails here
+/// rather than dropping out of the list.
+async fn guarded_tables(database: &Database) -> Vec<String> {
+    let tables: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT relname::text, relforcerowsecurity FROM pg_class
+          WHERE relnamespace = current_schema()::regnamespace AND relrowsecurity
+          ORDER BY relname",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("list the guarded tables");
+    let unforced: Vec<&str> = tables
+        .iter()
+        .filter(|(_, forced)| !forced)
+        .map(|(table, _)| table.as_str())
+        .collect();
+    assert!(
+        unforced.is_empty(),
+        "row-level security is forced on every guarded table: {unforced:?}"
+    );
+    tables.into_iter().map(|(table, _)| table).collect()
+}
+
+/// Outside a scoped transaction the tables' owner sees no guarded row.
+///
+/// Hosted, the connection owns the tables and is no superuser, so without the
+/// force it would skip row-level security and reach every project. Played
+/// here by a role made owner of every guarded table inside a transaction that
+/// is rolled back: it reads, updates and inserts nothing.
+async fn the_tables_owner_sees_nothing_outside_a_scoped_transaction(database: &Database) {
+    let guarded = guarded_tables(database).await;
+    assert!(!guarded.is_empty(), "the premise: some table is guarded");
+    let mut connection = database.pool().acquire().await.expect("a connection");
+    let mut setup =
+        vec!["BEGIN; CREATE ROLE owner_probe NOLOGIN NOSUPERUSER NOBYPASSRLS".to_string()];
+    setup.extend(
+        guarded
+            .iter()
+            .map(|table| format!("ALTER TABLE {table} OWNER TO owner_probe")),
+    );
+    setup.push("SET LOCAL ROLE owner_probe".to_string());
+    for statement in setup {
+        sqlx::raw_sql(AssertSqlSafe(statement.as_str()))
+            .execute(&mut *connection)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    for table in &guarded {
+        let (seen,): (i64,) =
+            sqlx::query_as(AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap_or_else(|error| panic!("counting {table} as the owner: {error}"));
+        assert_eq!(seen, 0, "the owner sees no row of {table}");
+        let touched = sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {table} SET project_id = project_id"
+        )))
+        .execute(&mut *connection)
+        .await
+        .unwrap_or_else(|error| panic!("updating {table} as the owner: {error}"));
+        assert_eq!(
+            touched.rows_affected(),
+            0,
+            "the owner updates no row of {table}"
+        );
+        // Refused by the policies before any constraint is checked, so an
+        // empty row is enough; a savepoint keeps the transaction going.
+        sqlx::raw_sql("SAVEPOINT insert_probe")
+            .execute(&mut *connection)
+            .await
+            .expect("savepoint");
+        let inserted = sqlx::query(AssertSqlSafe(format!("INSERT INTO {table} DEFAULT VALUES")))
+            .execute(&mut *connection)
+            .await;
+        // insufficient_privilege: the role owns the table, so row-level
+        // security is the only denial these tables can raise today: none has
+        // a trigger of its own, a sequence or a default that reaches another
+        // object.
+        let refused = inserted
+            .as_ref()
+            .err()
+            .and_then(|error| error.as_database_error())
+            .is_some_and(|error| error.code().as_deref() == Some("42501"));
+        assert!(
+            refused,
+            "the owner's insert into {table} is refused by row-level security: {inserted:?}"
+        );
+        sqlx::raw_sql("ROLLBACK TO SAVEPOINT insert_probe")
+            .execute(&mut *connection)
+            .await
+            .expect("roll back to the savepoint");
+    }
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .expect("roll back");
+}
+
 /// Purging a project deletes every row it owns and nothing of any other.
 ///
 /// Two halves. The catalogue says every table with a `project_id` cascades
@@ -276,10 +479,13 @@ async fn purging_a_project_leaves_none_of_its_rows(database: &Database) {
     );
     let others = rows(id, true).await;
 
-    let purged = repository::purge_project(database.pool(), &name)
+    // In the project's scoped transaction, as the server purges.
+    let mut scoped = database.scoped(id.into()).await.expect("scoped");
+    let purged = repository::purge_project(&mut *scoped, id.into())
         .await
         .expect("purge")
         .expect("the project existed");
+    scoped.commit().await.expect("commit the purge");
     assert_eq!(purged.id.0, id);
     assert!(purged.topics > 0, "{purged:?}");
 
@@ -295,9 +501,12 @@ async fn purging_a_project_leaves_none_of_its_rows(database: &Database) {
         "another project's rows changed"
     );
     assert_eq!(
-        repository::purge_project(database.pool(), &name)
-            .await
-            .expect("purge again"),
+        repository::purge_project(
+            &mut *database.scoped(id.into()).await.expect("scoped"),
+            id.into()
+        )
+        .await
+        .expect("purge again"),
         None,
         "a second purge finds nothing"
     );

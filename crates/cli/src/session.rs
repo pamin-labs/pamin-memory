@@ -14,20 +14,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use memory_client::settings::DATABASE_URL;
 use memory_core::ProjectId;
-use memory_engine::{Engine, Models};
+use memory_engine::{Engine, Models, Rebuilt};
 use memory_index::{Access, IndexError, VectorIndex};
 use memory_store::{Connections, Database, Workspace, repository};
 
 use crate::registry::Registry;
 use tokio::sync::Mutex;
 
-/// How long a purge waits for requests already inside the project's index.
+/// How long a purge or a rebuild waits for requests already inside the
+/// project's index.
 ///
 /// A reshape copies the whole index and can take a while; past this the
-/// purge is refused and can be asked for again.
-const PURGE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+/// purge or rebuild is refused and can be asked for again.
+const RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The database, and whatever has been opened against it so far.
 pub struct Session {
@@ -71,7 +73,8 @@ impl Drop for Serving<'_> {
 }
 
 impl Session {
-    /// Connects, migrates, and holds the result.
+    /// Connects, migrates a workspace's own cluster (an external database
+    /// must already be migrated), and holds the result.
     ///
     /// With a resident's pool: the server holding this is the only process
     /// the CLI talks to the cluster from.
@@ -82,9 +85,18 @@ impl Session {
         settings: memory_engine::Settings,
         open_indexes: usize,
     ) -> Result<Self> {
+        let database = Database::open(workspace, Connections::Resident, &settings.store).await;
+        // The store names no variable; an external server is the one this
+        // process was given in the environment.
+        let database = match &settings.store.external {
+            Some(_) => database.with_context(|| {
+                format!("opening the PostgreSQL server named by {DATABASE_URL}")
+            })?,
+            None => database?,
+        };
         Ok(Self {
             workspace: workspace.clone(),
-            database: Database::open(workspace, Connections::Resident, &settings.store).await?,
+            database,
             models: Models::new(settings),
             projects: Mutex::default(),
             engines: Registry::with_capacity(open_indexes),
@@ -301,6 +313,9 @@ impl Session {
     pub async fn engine(&self, project: &str, vector_index: VectorIndex) -> Result<Arc<Engine>> {
         let engine = self
             .engines
+            // A missing or unfinished index is rebuilt inside the open, which
+            // holds the slot: every caller waits for the rebuild, and one that
+            // fails leaves the slot empty.
             .get_or_open(project.to_string(), || {
                 Engine::attached(
                     self.database.clone(),
@@ -382,18 +397,32 @@ impl Session {
              run `pamin-memory reindex` first so a purge can remove one project's index"
         );
         self.engines
-            .take_then(project.to_string(), PURGE_PATIENCE, || async {
-                let mut transaction = self.database.pool().begin().await?;
-                let purged = repository::purge_project(&mut *transaction, project).await?;
-                if let Some(purged) = &purged {
+            .take_then(project.to_string(), RELEASE_PATIENCE, || async {
+                // Found by name, deleted by id: a project another server purged
+                // in between, and maybe made again, is looked up afresh.
+                let purged = loop {
+                    let Some(id) = repository::find_project(self.database.pool(), project)
+                        .await?
+                        .map(|found| found.id)
+                    else {
+                        break None;
+                    };
+                    let mut transaction = self.database.scoped(id).await?;
+                    let Some(purged) = repository::purge_project(&mut *transaction, id).await?
+                    else {
+                        continue;
+                    };
                     match tokio::fs::remove_dir_all(self.workspace.index_dir(purged.id)).await {
                         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                             return Err(error.into());
                         }
                         _ => {}
                     }
-                }
-                transaction.commit().await?;
+                    transaction.commit().await?;
+                    break Some(purged);
+                };
+                // Also when nothing was found: the id cached here may be one
+                // another server has purged.
                 self.projects.lock().await.remove(project);
                 if let (Some(purged), Some(syncing)) = (&purged, self.syncing()) {
                     for path in &purged.synced {
@@ -403,28 +432,42 @@ impl Session {
                 Ok(purged)
             })
             .await
+            .map_err(held_by_work)
     }
 
-    /// An engine with this project's index discarded first, for a rebuild.
+    /// Rebuilds this project's index from the ledger, discarding it first.
     ///
     /// Evicts rather than reuses: the rebuild throws the collection away and
-    /// opens a new one, so an engine held from before points at a directory
-    /// that is gone.
-    pub async fn rebuilding(
-        &self,
-        project: &str,
-        vector_index: VectorIndex,
-    ) -> Result<Arc<Engine>> {
+    /// opens a new one, so it waits until no request holds the old engine,
+    /// whose writes would land in the directory being discarded. Rebuilt
+    /// inside the slot, so a rebuild that fails leaves it empty rather than
+    /// holding a half-built index that answers from part of the ledger.
+    pub async fn rebuild(&self, project: &str, vector_index: VectorIndex) -> Result<Rebuilt> {
+        let mut rebuilt = None;
         self.engines
-            .reopen(project.to_string(), || {
-                Engine::rebuilding_attached(
+            .reopen(project.to_string(), RELEASE_PATIENCE, || async {
+                let (engine, done) = Engine::rebuilt_attached(
                     self.database.clone(),
                     &self.models,
                     &self.workspace,
                     project,
                     vector_index,
                 )
+                .await?;
+                rebuilt = Some(done);
+                Ok(engine)
             })
             .await
+            .map_err(held_by_work)?;
+        Ok(rebuilt.expect("set by the open that succeeded"))
+    }
+}
+
+/// Says what usually holds a project when waiting for it ran out.
+fn held_by_work(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<crate::registry::StillInUse>() {
+        error.context("the project is busy, most often with a reshape or an import")
+    } else {
+        error
     }
 }

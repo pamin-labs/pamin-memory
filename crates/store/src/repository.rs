@@ -78,36 +78,44 @@ sql_enum!(JobKind {
 /// autovacuum. `DO NOTHING` returns nothing on conflict, so the losing side of
 /// the race reads the winner's row instead.
 pub async fn ensure_project(pool: &PgPool, name: &str) -> Result<Project> {
-    const FIND: &str = "SELECT id, name, created_at FROM projects WHERE name = $1";
+    if let Some(project) = find_project(pool, name).await? {
+        return Ok(project);
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO projects (id, name, created_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (name) DO NOTHING
+         RETURNING id, name, created_at",
+    )
+    .bind(ProjectId::new().0)
+    .bind(name)
+    .bind(OffsetDateTime::now_utc())
+    .fetch_optional(pool)
+    .await?;
+    match inserted {
+        Some(row) => Ok(project_from(&row)),
+        // Another writer created it in between.
+        None => find_project(pool, name)
+            .await?
+            .ok_or_else(|| sqlx::Error::RowNotFound.into()),
+    }
+}
 
-    let row = match sqlx::query(FIND).bind(name).fetch_optional(pool).await? {
-        Some(row) => row,
-        None => {
-            let inserted = sqlx::query(
-                "INSERT INTO projects (id, name, created_at)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (name) DO NOTHING
-                 RETURNING id, name, created_at",
-            )
-            .bind(ProjectId::new().0)
-            .bind(name)
-            .bind(OffsetDateTime::now_utc())
-            .fetch_optional(pool)
-            .await?;
+/// The project with this name, if there is one.
+pub async fn find_project(pool: &PgPool, name: &str) -> Result<Option<Project>> {
+    let row = sqlx::query("SELECT id, name, created_at FROM projects WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(project_from))
+}
 
-            match inserted {
-                Some(row) => row,
-                // Another writer created it in between.
-                None => sqlx::query(FIND).bind(name).fetch_one(pool).await?,
-            }
-        }
-    };
-
-    Ok(Project {
+fn project_from(row: &sqlx::postgres::PgRow) -> Project {
+    Project {
         id: row.get::<uuid::Uuid, _>("id").into(),
         name: row.get("name"),
         created_at: row.get("created_at"),
-    })
+    }
 }
 
 /// What [`purge_project`] deleted.
@@ -120,19 +128,22 @@ pub struct PurgedProject {
     pub synced: Vec<String>,
 }
 
-/// Deletes the project with this name and every row it owns, for good.
+/// Deletes this project and every row it owns, for good.
 ///
 /// Unlike a retraction, which closes a validity interval and keeps the
 /// history, this is for privacy requests: nothing of the project is left to
 /// query. Every table references `projects` with `ON DELETE CASCADE`, so one
 /// statement removes it all; the counts come from the same statement's
 /// snapshot, taken before the delete. `None` when there is no such project.
+///
+/// Run it in the project's [`scoped`](crate::Database::scoped) transaction:
+/// the counts read guarded tables, which show an owner nothing (V21).
 pub async fn purge_project(
     executor: impl PgExecutor<'_>,
-    name: &str,
+    project: ProjectId,
 ) -> Result<Option<PurgedProject>> {
     let row: Option<(uuid::Uuid, i64, i64, Vec<String>)> = sqlx::query_as(
-        "WITH gone AS (DELETE FROM projects WHERE name = $1 RETURNING id)
+        "WITH gone AS (DELETE FROM projects WHERE id = $1 RETURNING id)
          SELECT gone.id,
                 (SELECT count(*) FROM topics WHERE project_id = gone.id),
                 (SELECT count(*) FROM sources WHERE project_id = gone.id),
@@ -140,7 +151,7 @@ pub async fn purge_project(
                        WHERE project_id = gone.id ORDER BY path)
            FROM gone",
     )
-    .bind(name)
+    .bind(project.0)
     .fetch_optional(executor)
     .await?;
     Ok(row.map(|(id, topics, sources, synced)| PurgedProject {
@@ -1874,6 +1885,102 @@ pub async fn forget_file_record_of(
     .bind(topic)
     .execute(executor)
     .await?;
+    Ok(())
+}
+
+/// A span's vector as it was embedded. See `V22__span_vectors`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanVector {
+    /// The hash of the text the vector was embedded from.
+    pub passage_hash: [u8; 32],
+    /// The plan that embedded it.
+    pub encoding: String,
+    /// Its fp16 codes, little-endian.
+    pub vector: Vec<u8>,
+}
+
+/// The vectors the model at `revision` embedded for these passages, under
+/// `encoding`, or under every plan that embedded one when it is `None`: a
+/// rebuild that loads no model has to choose among them.
+pub async fn span_vectors(
+    executor: impl PgExecutor<'_>,
+    project: ProjectId,
+    revision: &str,
+    encoding: Option<&str>,
+    passage_hashes: &[[u8; 32]],
+) -> Result<Vec<SpanVector>> {
+    if passage_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hashes: Vec<&[u8]> = passage_hashes.iter().map(|hash| hash.as_slice()).collect();
+    let rows: Vec<(Vec<u8>, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT passage_hash, encoding, vector FROM span_vectors
+          WHERE project_id = $1 AND revision = $2 AND passage_hash = ANY($3)
+            AND ($4::text IS NULL OR encoding = $4)",
+    )
+    .bind(project.0)
+    .bind(revision)
+    .bind(&hashes)
+    .bind(encoding)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(hash, encoding, vector)| SpanVector {
+            passage_hash: hash
+                .try_into()
+                .expect("span_vectors checks passage_hash is 32 bytes"),
+            encoding,
+            vector,
+        })
+        .collect())
+}
+
+/// Rows per `span_vectors` insert, so no one statement grows with the
+/// project.
+pub const PUT_SPAN_VECTORS_BATCH: usize = 1_000;
+
+/// Keeps each vector, embedded by the model at `revision` under `encoding`
+/// from the passage hashed beside it, [`PUT_SPAN_VECTORS_BATCH`] rows a
+/// statement, all on `connection`, so a caller's transaction keeps all or
+/// none. One already kept stays: the same model and plan over the same text
+/// give the same vector. Unless it is of another width, which no reader
+/// takes, so it is put right rather than left to cost every rebuild.
+pub async fn put_span_vectors<'a>(
+    connection: &mut sqlx::PgConnection,
+    project: ProjectId,
+    revision: &str,
+    encoding: &str,
+    vectors: impl IntoIterator<Item = &'a ([u8; 32], Vec<u8>)>,
+) -> Result<()> {
+    let mut rows: Vec<(&[u8], &[u8])> = vectors
+        .into_iter()
+        .map(|(hash, vector)| (hash.as_slice(), vector.as_slice()))
+        .collect();
+    // In one order, so two keeps of overlapping spans lock their rows in the
+    // same order and neither waits on a row the other holds. And once each:
+    // one statement may not update a row it inserted. Which duplicate stays
+    // does not matter: one hash is one text, embedded to one vector.
+    rows.sort_unstable_by_key(|(hash, _)| *hash);
+    rows.dedup_by_key(|(hash, _)| *hash);
+    for batch in rows.chunks(PUT_SPAN_VECTORS_BATCH) {
+        let (hashes, vectors): (Vec<&[u8]>, Vec<&[u8]>) = batch.iter().copied().unzip();
+        sqlx::query(
+            "INSERT INTO span_vectors (project_id, revision, passage_hash, encoding, vector)
+             SELECT $1, $2, passage_hash, $3, vector FROM unnest($4::bytea[], $5::bytea[])
+                    AS v (passage_hash, vector)
+             ON CONFLICT (project_id, revision, passage_hash, encoding) DO UPDATE
+                SET vector = EXCLUDED.vector
+              WHERE octet_length(span_vectors.vector) <> octet_length(EXCLUDED.vector)",
+        )
+        .bind(project.0)
+        .bind(revision)
+        .bind(encoding)
+        .bind(hashes)
+        .bind(vectors)
+        .execute(&mut *connection)
+        .await?;
+    }
     Ok(())
 }
 
