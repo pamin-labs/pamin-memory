@@ -601,9 +601,24 @@ impl Models {
     }
 
     /// The revision the next load of the embedder runs, without loading it
-    /// ([`memory_index::cached_revision`]).
-    pub(crate) fn cached_revision(&self) -> Option<String> {
+    /// ([`memory_index::cached_revision`]). Another process may have moved it
+    /// past the embedder already loaded.
+    fn cached_revision(&self) -> Option<String> {
         memory_index::cached_revision(&self.dir)
+    }
+
+    /// The embedder held now, if one is, without loading one. Stamped as a
+    /// use, like [`Models::embedder`]; the clone keeps an idle release off it
+    /// while the caller holds it.
+    fn loaded_embedder(&self) -> Option<Arc<Mutex<Embedder>>> {
+        self.loaded
+            .lock()
+            .expect("the model registry lock is poisoned")
+            .as_mut()
+            .map(|(last_used, embedder)| {
+                *last_used = Instant::now();
+                Arc::clone(embedder)
+            })
     }
 
     /// Reads and writes the weights cached in `settings`' model directory,
@@ -1346,6 +1361,32 @@ impl Engine {
     /// [`index`]: Self::index
     pub(crate) fn index_for_upkeep(&self) -> Arc<dyn Projection + Send + Sync> {
         Arc::clone(&self.index())
+    }
+
+    /// The revision this engine embeds with, without loading a model: the one
+    /// it holds, else the one the registry holds, which it then keeps, so the
+    /// model it vouched for is the one its searches embed with; else what a
+    /// load would read from the cache. Kept vectors are reused only under it,
+    /// so a rebuild never writes another revision's vectors into an index its
+    /// searches embed for differently. Waits for the model while another
+    /// caller is embedding with it.
+    ///
+    /// ponytail: with no model loaded, the cache can still move between this
+    /// read and the first load; only loading the model would close that.
+    pub(crate) fn embedding_revision(&self) -> Option<String> {
+        let held = self.embedder.get().or_else(|| {
+            self.models
+                .loaded_embedder()
+                .map(|loaded| self.embedder.get_or_init(|| loaded))
+        });
+        match held {
+            Some(held) => Some(
+                held.lock()
+                    .expect("the embedder lock is poisoned")
+                    .revision(),
+            ),
+            None => self.models.cached_revision(),
+        }
     }
 
     /// The model, loading it the first time anything asks.

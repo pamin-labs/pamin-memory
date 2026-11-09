@@ -313,16 +313,15 @@ impl Engine {
     }
 
     /// What a rebuild that has not loaded the model can stand in for `topics`
-    /// with: every plan the next load's revision kept for them
-    /// ([`Kept::split_for_rebuild`]). Nothing while no revision is pinned to
-    /// match.
+    /// with: every plan kept for them under the revision this engine embeds
+    /// with ([`Engine::embedding_revision`], [`Kept::split_for_rebuild`]).
+    /// Nothing while no revision is pinned to match.
     ///
-    /// ponytail: with no model cached there is no revision to look up by, so
-    /// a rebuild embeds everything even when the database kept it all.
-    /// Deployments that ship the model cached never meet this; ask the loaded
-    /// model's revision instead if a node ever starts without it.
+    /// ponytail: with no model loaded or cached there is no revision to look
+    /// up by, so a rebuild embeds everything even when the database kept it
+    /// all. Deployments that ship the model cached never meet this.
     pub(crate) async fn kept_for_rebuild(&self, topics: &[&[Passage<'_>]]) -> Kept {
-        let Some(revision) = off_the_runtime(|| self.models.cached_revision()) else {
+        let Some(revision) = off_the_runtime(|| self.embedding_revision()) else {
             return Kept::default();
         };
         // ponytail: holds every kept vector of these topics at once, so a
