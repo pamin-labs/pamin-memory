@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "skills": {
+    "pamin-engineering": {
+      "source": "pamin-labs/skills",
+      "commit": "defa71c168411f5d8905fe1236cccf6f40b61b75",
+      "sourceType": "github",
+      "skillPath": "skills/pamin-engineering/SKILL.md",
+      "computedHash": "a42d4bc070439105a82d9aba730e79b8dc4a1d4144294bf1df7f80dc1a195192"
+    }
+  }
+}

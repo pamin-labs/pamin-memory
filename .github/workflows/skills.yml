@@ -1,0 +1,78 @@
+name: Shared skills
+
+on:
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shared-skills-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.DEFAULT_BRANCH }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Update project skills
+        env:
+          DISABLE_TELEMETRY: '1'
+          DO_NOT_TRACK: '1'
+        run: npx -y skills@1.9.0 update -p -y
+      - name: Commit shared skills changes
+        id: commit
+        shell: bash
+        run: |
+          git add --all
+          paths=$(mktemp)
+          trap 'rm -f "$paths"' EXIT
+          # Count both sides of a rename and preserve paths with special characters.
+          git diff --cached --no-renames --name-only -z > "$paths"
+          [[ -s "$paths" ]] || exit 0
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              skills-lock.json|.agents/skills/*|.claude/skills/*) ;;
+              *) printf 'Skills sync changed an unexpected path: %q\n' "$path" >&2; exit 1 ;;
+            esac
+          done < "$paths"
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m 'chore(skills): sync shared skills'
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Push shared skills to the default branch
+        if: steps.commit.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKILLS_SYNC_DEPLOY_KEY: ${{ secrets.SKILLS_SYNC_DEPLOY_KEY }}
+        run: |
+          refspec="HEAD:refs/heads/$DEFAULT_BRANCH"
+          if [[ -n "$SKILLS_SYNC_DEPLOY_KEY" ]]; then
+            umask 077
+            ssh_dir=$(mktemp -d "$RUNNER_TEMP/skills-sync.XXXXXX")
+            trap 'rm -rf -- "$ssh_dir"' EXIT
+            printf '%s\n' "$SKILLS_SYNC_DEPLOY_KEY" > "$ssh_dir/key"
+            unset SKILLS_SYNC_DEPLOY_KEY GH_TOKEN
+            # GitHub's published Ed25519 host key.
+            printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$ssh_dir/known_hosts"
+            export ssh_dir
+            # Git's SSH command shell expands ssh_dir with the paths quoted.
+            # shellcheck disable=SC2016
+            GIT_SSH_COMMAND='ssh -F /dev/null -i "$ssh_dir/key" -o IdentityAgent=none -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$ssh_dir/known_hosts"' \
+              git push "git@github.com:$GITHUB_REPOSITORY.git" "$refspec"
+            exit
+          fi
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            push origin "$refspec"

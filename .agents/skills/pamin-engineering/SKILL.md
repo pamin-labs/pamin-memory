@@ -5,17 +5,17 @@ description: The engineering bar for code in this repository - fast, small, quic
 
 # The engineering bar
 
-Every repository that carries this skill holds code to one bar: high performance, low resource use, fast builds, and clean, DRY, decoupled code that is easy to maintain and extend. The rules live once, in `references/`, and each `AGENTS.md` imports the ones its code needs. This file is how to use them while you work; it states no rule of its own.
+Every repository that carries this skill holds code to one bar, stated once in `references/`; each `AGENTS.md` imports the references its code needs. This file says how to use them and states no rule of its own.
 
 ## Decide before you write
 
-Walk these in order, and stop at the first that answers.
+Walk these in order and stop at the first that answers; each is a rule of `core.md`.
 
-1. **Does it need to exist?** Is a real caller asking for it now? If it is for a second use that has not appeared (an option, a layer, an interface, a setting), do not build it.
-2. **Does it exist already?** Search this repository, then the shared libraries it depends on, for the same concern. If an owner exists, extend it through its interface.
-3. **Can something else do it?** Climb the reuse ladder in `core.md` ("Do not reinvent what exists"): the official SDK, the standard library, the platform, a dependency already in the tree, then a new maintained one. Writing it yourself is the last rung, and the PR's "Reused" section says why.
-4. **Where does it go?** Find its layer and directory in the `AGENTS.md` of the area you are in ("Layers here", the layout or module list). If no directory fits, the layout changes in the same PR.
-5. **Will it be faster or smaller?** Then measure before and after, on the entry point the product calls, and put both numbers in the PR. No number, no claim.
+1. **Does it need to exist?** Not for a second use that has not appeared.
+2. **Does it exist already?** Search this repository, then its shared libraries, and extend the owner through its interface ("One implementation per concern").
+3. **Can something else do it?** Climb `core.md`'s "Do not reinvent what exists"; writing it yourself is the last rung, explained in the PR's "Reused" section.
+4. **Where does it go?** Its layer and directory are in the area's `AGENTS.md` ("Layers here", the layout or module list); if none fits, the layout changes in the same PR.
+5. **Will it be faster or smaller?** Measure before and after on the entry point the product calls, with both numbers in the PR. No number, no claim.
 
 ## Which reference to read
 
@@ -29,35 +29,25 @@ Read every reference the change touches, before writing and again before the PR 
 | `references/performance.md` | Touching a request's hot path, a pool, start-up, or a benchmark |
 | `references/web.md` | A React, Vite and TypeScript web client or operator console |
 | `references/workers.md` | A Cloudflare Worker: routing, containers, config, deploys |
+| `references/rule-scan.md` | Running or continuing a rule-scan pass over a whole repository |
 
 `AGENTS.md` files import these with `@` lines, so Claude Code loads them already; other tools open the paths they name.
 
 ## When the reference and the repository disagree
 
-- The repository's `AGENTS.md` says how it meets each rule and what it has not built yet; it never weakens a rule. A gap it names is not a licence to add to it: new code follows the rule.
-- A rule that seems wrong for a case is raised with the owner and recorded in a decision record, then changed in `references/` in every repository together. Do not work around it in code.
+- A repository's `AGENTS.md` says how it meets each rule and what it has not built yet; it never weakens a rule, and a gap it names is no licence to widen: new code follows the rule.
+- A rule that seems wrong for a case is raised with the owner and recorded in a decision record, then changed in `pamin-labs/skills`; never work around it in code.
 
-## Reviewing a change
+## Reviewing a change and opening the PR
 
-1. Read the whole diff, tests included.
-2. Hold it against every rule of each reference its files import, and each rule of the `AGENTS.md` files it touches.
-3. Check the extensibility test in `core.md`: would one more of the same thing touch one place?
-4. Fix what misses in new commits, then run the peer-review skill, as `core.md`'s "Review before every PR" says.
-
-## Before the PR opens
-
-1. Rebase on the latest `main`, and build on anything overlapping that landed.
-2. Run the gates of every `AGENTS.md` the change touches, locally.
-3. Review it as above, then write the description and commits as `core.md`'s "Commits and PRs" asks; the coordination tool's commit skill checks the mechanics.
-4. Put measurements, with how they were taken, under the PR's verification.
+Follow `core.md`'s "Working and review" and "Commits and PRs": rebase and build on what landed, run every touched `AGENTS.md`'s gates locally, hold the whole diff, tests included, against every imported reference and touched `AGENTS.md`, apply the extensibility check (would one more of the same thing touch one place?), fix misses in new commits, run the peer-review skill, and put measurements and how they were taken under the PR's verification. The coordination tool's commit skill checks the mechanics.
 
 ## Where a question goes
 
-- A rule for every language: `core.md`.
-- How one language meets it: that language's reference.
-- How this repository meets it, its layers, its crates or packages, its gates: its own `AGENTS.md`.
-- Why a rule exists, and who decided it: the decision records, cited with a SHA permalink.
+- A rule for every language: `core.md`; how one language meets it: that language's reference.
+- How this repository meets it, its layers, crates or packages, and gates: its own `AGENTS.md`.
+- Why a rule exists and who decided it: the decision records, cited with a SHA permalink.
 
 ## Changing these rules
 
-`references/` is identical in every repository that carries this skill. A change to a reference is made in all of them together, cites its decision record, and adds no repository-specific fact: those stay in the repository's own `AGENTS.md`.
+This skill's source is the public `pamin-labs/skills` repository; a repository installs it with the skills CLI and never edits its copy. A change is made there, cites its decision record, and adds no repository-specific fact; those stay in the repository's `AGENTS.md`.
