@@ -61,16 +61,21 @@ jobs:
           refspec="HEAD:refs/heads/$DEFAULT_BRANCH"
           if [[ -n "$SKILLS_SYNC_DEPLOY_KEY" ]]; then
             umask 077
+            # Keep the credentials out of child environments and the deploy key off disk.
+            export -n SKILLS_SYNC_DEPLOY_KEY GH_TOKEN
+            unset SSH_AGENT_PID
             ssh_dir=$(mktemp -d "$RUNNER_TEMP/skills-sync.XXXXXX")
-            trap 'rm -rf -- "$ssh_dir"' EXIT
-            printf '%s\n' "$SKILLS_SYNC_DEPLOY_KEY" > "$ssh_dir/key"
+            trap 'if [[ -n "${SSH_AGENT_PID:-}" ]]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf -- "$ssh_dir"' EXIT
+            agent_env=$(ssh-agent -s -a "$ssh_dir/agent.sock")
+            eval "$agent_env"
+            printf '%s\n' "$SKILLS_SYNC_DEPLOY_KEY" | ssh-add -
             unset SKILLS_SYNC_DEPLOY_KEY GH_TOKEN
             # GitHub's published Ed25519 host key.
             printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$ssh_dir/known_hosts"
             export ssh_dir
             # Git's SSH command shell expands ssh_dir with the paths quoted.
             # shellcheck disable=SC2016
-            GIT_SSH_COMMAND='ssh -F /dev/null -i "$ssh_dir/key" -o IdentityAgent=none -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$ssh_dir/known_hosts"' \
+            GIT_SSH_COMMAND='ssh -F /dev/null -o IdentityFile=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$ssh_dir/known_hosts"' \
               git push "git@github.com:$GITHUB_REPOSITORY.git" "$refspec"
             exit
           fi
