@@ -1,6 +1,6 @@
 # Rule scans
 
-A rule-scan pass reads a repository against `core.md`, the references it imports and its `AGENTS.md` files, and fixes where the code misses a written rule; it invents no rules.
+Read this when running or continuing a rule-scan pass. A pass reads a repository against `core.md`, the references it imports and its `AGENTS.md` files, and fixes where the code misses a written rule; it invents no rules.
 
 ## Scope and verification
 
@@ -11,18 +11,18 @@ A rule-scan pass reads a repository against `core.md`, the references it imports
 
 Each verified finding has one class:
 
-- **Bug:** behaviour is wrong for a user, an operator or the data (a wrong answer, a lost write, a double charge).
+- **Bug:** behaviour is wrong for an end user, an operator or the data (a wrong answer, a lost write, a double charge).
 - **Copy or rule miss:** behaviour is right, but the code breaks a rule: a second copy of a value or rule, a crossed layer, a missing type.
 - **UI-only:** fixing it changes what a screen shows.
-- **Owner question:** fixing it needs a choice the written rules do not make, or two rules conflict.
+- **Question for the user:** fixing it needs a choice the written rules do not make, or two rules conflict.
 
 ## Fixing
 
 - **One PR per finding,** mergeable on its own.
-- **Behaviour first.** A fix comes with a test of the owner's behaviour that fails before the fix.
-- **A source guard only where it binds a rule.** A test that reads source text is added only for a structural rule (layers, imports, the layout against its `AGENTS.md` list, declaration order, typed ids, a committed generated file, a closed set against its source), or as a row in the project's one table of "only in its owner" rules, with the owner file and the reason on the row, when nothing else can see the copy.
+- **Behaviour first.** A fix comes with a test of the owning function's behaviour that fails before the fix.
+- **A source guard only where it binds a rule.** A test that reads source text is added only for a structural rule (layers, imports, the layout against its `AGENTS.md` list, declaration order, typed ids, a committed generated file, a closed set against its source), or as a row in the project's source-rules test naming the file that owns the rule and the reason, when nothing else can see the copy.
 - **No guard that only pins a past spelling:** none that refuses one old spelling in one or two files, or repeats what a type check, a lint rule or another guard refuses. A pattern the linter can check goes to the linter.
-- **UI-only findings and owner questions are listed apart and never fixed silently.** A UI-only fix waits for the owner's look at its before-and-after screenshots; an owner question goes to the owner with options and a recommendation, and its answer is recorded in a decision record before any fix.
+- **UI-only findings and questions for the user are listed apart and never fixed silently.** A UI-only fix waits for the user's look at its before-and-after screenshots (`web-interface.md`); a question goes to the user with options and a recommendation, and its answer is recorded in a decision record before any fix.
 
 ## Records
 

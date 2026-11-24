@@ -3,10 +3,10 @@
   "skills": {
     "pamin-engineering": {
       "source": "pamin-labs/skills",
-      "commit": "defa71c168411f5d8905fe1236cccf6f40b61b75",
+      "commit": "2498d1e41efb00efffa43ab762c2fca806447d32",
       "sourceType": "github",
       "skillPath": "skills/pamin-engineering/SKILL.md",
-      "computedHash": "a42d4bc070439105a82d9aba730e79b8dc4a1d4144294bf1df7f80dc1a195192"
+      "computedHash": "301d8ec1b6829efadbcfeea3cf8e83e3b60d77ab930967f65b2744cbbdf6ecf8"
     }
   }
 }
