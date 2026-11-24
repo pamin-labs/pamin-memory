@@ -83,54 +83,7 @@ fn priority(kind: JobKind) -> i32 {
     }
 }
 
-/// The statement that queues work, as a fragment for whatever statement
-/// carries it.
-///
-/// [`enqueue_all`] runs it alone. The write transaction runs it as one more
-/// data-modifying `WITH` of the statement that appends the state it is about,
-/// because that was the last statement of the transaction and needed nothing
-/// from the one before it but the topic it already had. Both are built from
-/// this, so the conflict behaviour a replay and a completion depend on has one
-/// definition rather than two that have to be kept equal.
-///
-/// The arguments name the placeholders each value is bound to: the project,
-/// the subject, the time the work is due and was asked for, and the three
-/// arrays [`Queued::bind`] binds -- ids, kinds, priorities -- in that order.
-///
-/// The conflict target is the work itself -- project, kind, subject -- and a
-/// job without a subject conflicts with another without one, because the
-/// constraint treats nulls as equal. See V12. A conflict means the same work
-/// is still pending, so the request is already represented by it; it clears
-/// the claim, which is what keeps a worker from marking work done that was
-/// requested after it started reading: [`complete`] only completes a job it
-/// still holds.
-#[rustfmt::skip] // One argument per line would bury the statement.
-macro_rules! enqueue_jobs {
-    (
-        project = $project:literal,
-        subject = $subject:literal,
-        at = $at:literal,
-        rows = [$ids:literal, $kinds:literal, $priorities:literal $(,)?] $(,)?
-    ) => {
-        concat!(
-            "INSERT INTO index_jobs
-                 (id, project_id, job_type, subject, available_at, created_at, priority)
-             SELECT job.id, ", $project, ", job.label, ", $subject, ", ", $at, ", ", $at, ", job.priority
-               FROM unnest(", $ids, "::uuid[], ", $kinds, "::text[], ", $priorities, "::int[])
-                 AS job(id, label, priority)
-             ON CONFLICT (project_id, job_type, subject) DO UPDATE
-                 SET available_at = ", $at, ",
-                     claimed_at   = NULL,
-                     claimed_by   = NULL,
-                     last_error   = NULL,
-                     attempts     = 0"
-        )
-    };
-}
-
-pub(crate) use enqueue_jobs;
-
-/// The rows a set of kinds queues, for the arrays [`enqueue_jobs!`] reads.
+/// The arrays bound by the standalone and promoted-write enqueue statements.
 pub(crate) struct Queued {
     ids: Vec<uuid::Uuid>,
     kinds: Vec<&'static str>,
@@ -173,9 +126,6 @@ pub async fn enqueue(
     kind: JobKind,
     subject: Option<uuid::Uuid>,
 ) -> Result<()> {
-    // Through the batched form with one kind in it, so the statement -- and
-    // with it the conflict behaviour a replay depends on -- has one
-    // definition rather than two that have to be kept equal.
     enqueue_all(executor, project, &[kind], subject).await
 }
 
@@ -186,9 +136,8 @@ pub async fn enqueue(
 /// before wants the memories that already named it found. Three is the right
 /// number -- they are different work at different priorities, and merging them
 /// would make every rewrite of an existing topic pay for a scan it does not
-/// need. The write queues them inside its own statement, from the same
-/// `enqueue_jobs!` fragment this runs, so there is one definition of what
-/// queueing a job means.
+/// need. The promoted-write statement queues them with the same conflict and
+/// claim-reset rules as this statement.
 ///
 /// `unnest` turns the arrays into rows so the statement stays `'static`, which
 /// is the same reason the rest of this crate writes its `IN` lists that way.
@@ -202,12 +151,7 @@ pub async fn enqueue_all(
         return Ok(());
     }
 
-    const ENQUEUE: &str = enqueue_jobs!(
-        project = "$1",
-        subject = "$2",
-        at = "$3",
-        rows = ["$4", "$5", "$6"]
-    );
+    const ENQUEUE: &str = include_str!("../sql/jobs/enqueue_jobs.sql");
     let query = sqlx::query(ENQUEUE)
         .bind(project.0)
         .bind(subject)
@@ -251,44 +195,17 @@ pub async fn claim(
     kinds: &[JobKind],
 ) -> Result<Vec<Job>> {
     let now = OffsetDateTime::now_utc();
-    let rows = sqlx::query(
-        "UPDATE index_jobs
-            SET claimed_at   = $1,
-                claimed_by   = $2,
-                attempts     = attempts + 1,
-                available_at = $3
-          WHERE id IN (
-              SELECT id FROM index_jobs
-               WHERE project_id = $6
-                 AND job_type = ANY($7)
-                 -- Says nothing `job_type` does not, since priority is a
-                 -- function of kind -- except to the index, which is ordered
-                 -- by project and priority and cannot see kind at all.
-                 -- Without it a claim for upkeep read every owed row to find
-                 -- none of its own.
-                 AND priority = ANY($8)
-                 AND available_at <= $1
-                 -- A job that has used its attempts stays pending with its
-                 -- error rather than coming round again. Retrying for ever
-                 -- turns one poisoned job into a worker that never does
-                 -- anything else; `cascade replay` is how it comes back.
-                 AND attempts < $5
-               ORDER BY priority, available_at
-                 FOR UPDATE SKIP LOCKED
-               LIMIT $4
-          )
-      RETURNING id, project_id, job_type, subject, attempts, claimed_at",
-    )
-    .bind(now)
-    .bind(worker)
-    .bind(now + LEASE)
-    .bind(i64::from(batch))
-    .bind(memory_core::MAX_ATTEMPTS)
-    .bind(project.0)
-    .bind(kinds.iter().map(|kind| kind.label()).collect::<Vec<_>>())
-    .bind(kinds.iter().map(|kind| priority(*kind)).collect::<Vec<_>>())
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/jobs/claim.sql"))
+        .bind(now)
+        .bind(worker)
+        .bind(now + LEASE)
+        .bind(i64::from(batch))
+        .bind(memory_core::MAX_ATTEMPTS)
+        .bind(project.0)
+        .bind(kinds.iter().map(|kind| kind.label()).collect::<Vec<_>>())
+        .bind(kinds.iter().map(|kind| priority(*kind)).collect::<Vec<_>>())
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows.iter().map(row_to_job).collect())
 }
@@ -356,19 +273,12 @@ pub async fn complete(
     // SQL's absent value is never true -- so it is not completed, which is the
     // answer.
     let claims: Vec<Option<OffsetDateTime>> = jobs.iter().map(|job| job.claimed_at).collect();
-    let rows = sqlx::query(
-        "DELETE FROM index_jobs
-          USING unnest($1::uuid[], $3::timestamptz[]) AS held (id, claimed_at)
-          WHERE index_jobs.id = held.id
-            AND index_jobs.claimed_by = $2
-            AND index_jobs.claimed_at = held.claimed_at
-      RETURNING index_jobs.id",
-    )
-    .bind(&ids)
-    .bind(worker)
-    .bind(&claims)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/jobs/complete.sql"))
+        .bind(&ids)
+        .bind(worker)
+        .bind(&claims)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows.iter().map(|row| IndexJobId(row.get("id"))).collect())
 }
@@ -388,32 +298,24 @@ pub async fn fail(
     let exhausted = job.attempts >= memory_core::MAX_ATTEMPTS;
     let retry_at = OffsetDateTime::now_utc() + RETRY_AFTER;
 
-    sqlx::query(
-        "UPDATE index_jobs
-            SET last_error   = $3,
-                claimed_at   = NULL,
-                claimed_by   = NULL,
-                available_at = CASE WHEN $4 THEN available_at ELSE $5 END
-          WHERE id = $1 AND claimed_by = $2",
-    )
-    .bind(job.id.0)
-    .bind(worker)
-    .bind(error)
-    .bind(exhausted)
-    .bind(retry_at)
-    .execute(executor)
-    .await?;
+    sqlx::query(include_str!("../sql/jobs/fail.sql"))
+        .bind(job.id.0)
+        .bind(worker)
+        .bind(error)
+        .bind(exhausted)
+        .bind(retry_at)
+        .execute(executor)
+        .await?;
 
     Ok(())
 }
 
 /// How many jobs are waiting, whether or not they are due yet.
 pub async fn pending(executor: impl PgExecutor<'_>, project: ProjectId) -> Result<i64> {
-    let (waiting,): (i64,) =
-        sqlx::query_as("SELECT count(*) FROM index_jobs WHERE project_id = $1")
-            .bind(project.0)
-            .fetch_one(executor)
-            .await?;
+    let (waiting,): (i64,) = sqlx::query_as(include_str!("../sql/jobs/pending.sql"))
+        .bind(project.0)
+        .fetch_one(executor)
+        .await?;
 
     Ok(waiting)
 }
@@ -441,21 +343,12 @@ pub async fn pending(executor: impl PgExecutor<'_>, project: ProjectId) -> Resul
 /// and it stops at the first such row instead of reading a backlog of failed
 /// jobs to the end.
 pub async fn any_in_flight(executor: impl PgExecutor<'_>, project: ProjectId) -> Result<bool> {
-    let (in_flight,): (bool,) = sqlx::query_as(
-        "SELECT EXISTS (
-             SELECT 1 FROM index_jobs
-              WHERE project_id = $1
-                AND (
-                    (claimed_at IS NOT NULL AND available_at > $2)
-                    OR (attempts < $3 AND (claimed_at IS NOT NULL OR available_at <= $2))
-                )
-         )",
-    )
-    .bind(project.0)
-    .bind(OffsetDateTime::now_utc())
-    .bind(memory_core::MAX_ATTEMPTS)
-    .fetch_one(executor)
-    .await?;
+    let (in_flight,): (bool,) = sqlx::query_as(include_str!("../sql/jobs/any_in_flight.sql"))
+        .bind(project.0)
+        .bind(OffsetDateTime::now_utc())
+        .bind(memory_core::MAX_ATTEMPTS)
+        .fetch_one(executor)
+        .await?;
 
     Ok(in_flight)
 }
@@ -476,15 +369,11 @@ pub async fn pending_up_to(
     project: ProjectId,
     cap: i64,
 ) -> Result<i64> {
-    let (waiting,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM (
-             SELECT 1 FROM index_jobs WHERE project_id = $1 LIMIT $2
-         ) AS owed",
-    )
-    .bind(project.0)
-    .bind(cap.max(0))
-    .fetch_one(executor)
-    .await?;
+    let (waiting,): (i64,) = sqlx::query_as(include_str!("../sql/jobs/pending_up_to.sql"))
+        .bind(project.0)
+        .bind(cap.max(0))
+        .fetch_one(executor)
+        .await?;
 
     Ok(waiting)
 }
@@ -516,34 +405,13 @@ pub struct Owing {
 /// import -- where a probe stops at the first. A workspace has tens or
 /// hundreds of projects, and this is asked every few seconds.
 pub async fn owing(executor: impl PgExecutor<'_>, kinds: &[JobKind]) -> Result<Vec<Owing>> {
-    let rows = sqlx::query(
-        "SELECT project.id, project.name,
-                EXISTS (
-                    SELECT 1 FROM index_jobs
-                     WHERE project_id = project.id
-                       AND job_type = ANY($1)
-                       AND priority = ANY($2)
-                       AND available_at <= $3
-                       AND attempts < $4
-                       AND last_error IS NULL
-                ) AS never_failed
-           FROM projects AS project
-          WHERE EXISTS (
-                    SELECT 1 FROM index_jobs
-                     WHERE project_id = project.id
-                       AND job_type = ANY($1)
-                       AND priority = ANY($2)
-                       AND available_at <= $3
-                       AND attempts < $4
-                )
-          ORDER BY project.name",
-    )
-    .bind(kinds.iter().map(|kind| kind.label()).collect::<Vec<_>>())
-    .bind(kinds.iter().map(|kind| priority(*kind)).collect::<Vec<_>>())
-    .bind(OffsetDateTime::now_utc())
-    .bind(memory_core::MAX_ATTEMPTS)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/jobs/owing.sql"))
+        .bind(kinds.iter().map(|kind| kind.label()).collect::<Vec<_>>())
+        .bind(kinds.iter().map(|kind| priority(*kind)).collect::<Vec<_>>())
+        .bind(OffsetDateTime::now_utc())
+        .bind(memory_core::MAX_ATTEMPTS)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -560,16 +428,11 @@ pub async fn exhausted(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<Vec<(Job, String)>> {
-    let rows = sqlx::query(
-        "SELECT id, project_id, job_type, subject, attempts, claimed_at, last_error
-           FROM index_jobs
-          WHERE project_id = $1 AND attempts >= $2
-          ORDER BY priority, available_at",
-    )
-    .bind(project.0)
-    .bind(memory_core::MAX_ATTEMPTS)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/jobs/exhausted.sql"))
+        .bind(project.0)
+        .bind(memory_core::MAX_ATTEMPTS)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -588,16 +451,12 @@ pub async fn exhausted(
 /// The manual counterpart to the retry the worker gives up on: whatever was
 /// wrong has presumably been fixed, and this says so.
 pub async fn replay(executor: impl PgExecutor<'_>, project: ProjectId) -> Result<u64> {
-    let revived = sqlx::query(
-        "UPDATE index_jobs
-            SET attempts = 0, available_at = $2, claimed_at = NULL, claimed_by = NULL
-          WHERE project_id = $1 AND attempts >= $3",
-    )
-    .bind(project.0)
-    .bind(OffsetDateTime::now_utc())
-    .bind(memory_core::MAX_ATTEMPTS)
-    .execute(executor)
-    .await?;
+    let revived = sqlx::query(include_str!("../sql/jobs/replay.sql"))
+        .bind(project.0)
+        .bind(OffsetDateTime::now_utc())
+        .bind(memory_core::MAX_ATTEMPTS)
+        .execute(executor)
+        .await?;
 
     Ok(revived.rows_affected())
 }
@@ -608,14 +467,11 @@ pub async fn replay(executor: impl PgExecutor<'_>, project: ProjectId) -> Result
 /// are both work nobody owes any more, and a later write to the same subject
 /// inserts a fresh row for it either way.
 pub async fn discard(executor: impl PgExecutor<'_>, project: ProjectId) -> Result<u64> {
-    let discarded = sqlx::query(
-        "DELETE FROM index_jobs
-          WHERE project_id = $1 AND attempts >= $2",
-    )
-    .bind(project.0)
-    .bind(memory_core::MAX_ATTEMPTS)
-    .execute(executor)
-    .await?;
+    let discarded = sqlx::query(include_str!("../sql/jobs/discard.sql"))
+        .bind(project.0)
+        .bind(memory_core::MAX_ATTEMPTS)
+        .execute(executor)
+        .await?;
 
     Ok(discarded.rows_affected())
 }

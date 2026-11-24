@@ -266,11 +266,9 @@ impl Database {
     /// servers often hand out an administrator login like that.
     #[doc(hidden)]
     pub async fn skipping_row_level_security(&self) -> Result<Vec<String>> {
-        let roles: Vec<(String,)> = sqlx::query_as(
-            "SELECT rolname::text FROM pg_roles
-              WHERE rolname IN (current_user, $1) AND (rolsuper OR rolbypassrls)
-              ORDER BY rolname",
-        )
+        let roles: Vec<(String,)> = sqlx::query_as(include_str!(
+            "../sql/database/roles_skipping_row_level_security.sql"
+        ))
         .bind(APP_ROLE)
         .fetch_all(&self.pool)
         .await?;
@@ -301,10 +299,14 @@ impl Database {
     /// guarded tables show it this project's rows alone and refuse a row of
     /// another. Commit it to keep what it wrote.
     pub async fn scoped(&self, project: ProjectId) -> Result<sqlx::Transaction<'static, Postgres>> {
-        // A UUID formatted from its type, so splicing it in is safe.
-        let begin = format!(
-            "BEGIN; SET LOCAL ROLE {APP_ROLE}; SET LOCAL app.project_id = '{}'",
-            project.0
+        // begin_with sends this batch through the simple protocol, which has
+        // no binds. UUID display only emits hex digits and hyphens.
+        let mut uuid_buffer = uuid::Uuid::encode_buffer();
+        let project = project.0.as_hyphenated().encode_lower(&mut uuid_buffer);
+        let begin = include_str!("../sql/database/begin_scoped_transaction.sql").replacen(
+            "__PROJECT_ID__",
+            project,
+            1,
         );
         Ok(self.pool.begin_with(sqlx::AssertSqlSafe(begin)).await?)
     }
