@@ -101,31 +101,6 @@ impl Assertion {
     }
 }
 
-/// The columns `row_to_version` reads.
-///
-/// A macro rather than a constant so the statements below can be assembled with
-/// `concat!` and stay `&'static str`, which is what the driver accepts without
-/// an explicit assertion that a built string is safe.
-macro_rules! version_columns {
-    () => {
-        version_columns!("")
-    };
-    // Qualified, for the one query that joins another table alongside. Written
-    // out rather than assembled from the unqualified list, because a macro that
-    // pastes a prefix onto a comma-separated string cannot be read at the call
-    // site and this is a list the reader has to be able to check.
-    ("v.") => {
-        "v.id, v.relationship_id, v.version, v.valid_from, v.valid_to, v.created_at, \
-         v.invalidated_at, v.supersedes, v.caused_by_topic_state, v.confidence, \
-         v.derivation, v.tombstone_reason"
-    };
-    ("") => {
-        "id, relationship_id, version, valid_from, valid_to, created_at, \
-         invalidated_at, supersedes, caused_by_topic_state, confidence, derivation, \
-         tombstone_reason"
-    };
-}
-
 fn row_to_version(row: &PgRow) -> RelationshipVersion {
     RelationshipVersion {
         id: row.get::<uuid::Uuid, _>("id").into(),
@@ -151,25 +126,17 @@ fn row_to_version(row: &PgRow) -> RelationshipVersion {
     }
 }
 
-const FIND_RELATIONSHIP: &str = "SELECT id, created_at FROM relationships
-                                 WHERE project_id = $1 AND from_topic = $2
-                                   AND to_topic = $3 AND kind = $4";
+const FIND_RELATIONSHIP: &str = include_str!("../sql/graph/find_relationship.sql");
 
 /// Loads the version of an edge currently believed, if any.
 pub async fn live_version(
     executor: impl PgExecutor<'_>,
     relationship: RelationshipId,
 ) -> Result<Option<RelationshipVersion>> {
-    let row = sqlx::query(concat!(
-        "SELECT ",
-        version_columns!(),
-        " FROM relationship_versions
-          WHERE relationship_id = $1 AND invalidated_at IS NULL
-          ORDER BY version DESC LIMIT 1"
-    ))
-    .bind(relationship.0)
-    .fetch_optional(executor)
-    .await?;
+    let row = sqlx::query(include_str!("../sql/graph/live_version.sql"))
+        .bind(relationship.0)
+        .fetch_optional(executor)
+        .await?;
 
     Ok(row.as_ref().map(row_to_version))
 }
@@ -184,16 +151,11 @@ pub async fn edge_history(
     project: ProjectId,
     relationship: RelationshipId,
 ) -> Result<Vec<RelationshipVersion>> {
-    let rows = sqlx::query(concat!(
-        "SELECT ",
-        version_columns!(),
-        " FROM relationship_versions
-          WHERE project_id = $1 AND relationship_id = $2 ORDER BY version ASC"
-    ))
-    .bind(project.0)
-    .bind(relationship.0)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/graph/edge_history.sql"))
+        .bind(project.0)
+        .bind(relationship.0)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows.iter().map(row_to_version).collect())
 }
@@ -313,23 +275,13 @@ async fn live_versions_of(
         .map(|(_, _, claim)| claim.kind.label().to_string())
         .collect();
 
-    let rows = sqlx::query(concat!(
-        "SELECT DISTINCT ON (r.id) r.from_topic, r.to_topic, r.kind, ",
-        version_columns!("v."),
-        " FROM unnest($2::uuid[], $3::uuid[], $4::text[]) AS wanted(from_topic, to_topic, kind)
-           JOIN relationships r
-             ON r.project_id = $1 AND r.from_topic = wanted.from_topic
-            AND r.to_topic = wanted.to_topic AND r.kind = wanted.kind
-           JOIN relationship_versions v
-             ON v.relationship_id = r.id AND v.invalidated_at IS NULL
-          ORDER BY r.id, v.version DESC"
-    ))
-    .bind(project.0)
-    .bind(&from)
-    .bind(&to)
-    .bind(&kinds)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/graph/live_versions_of.sql"))
+        .bind(project.0)
+        .bind(&from)
+        .bind(&to)
+        .bind(&kinds)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -430,51 +382,37 @@ async fn assert_within(
     let kinds: Vec<&'static str> = indices.iter().map(|&i| edges[i].2.kind.label()).collect();
     let now = OffsetDateTime::now_utc();
 
-    sqlx::query(
-        "INSERT INTO relationships (id, project_id, from_topic, to_topic, kind, created_at)
-         SELECT id, $1, from_topic, to_topic, kind, $2
-           FROM unnest($3::uuid[], $4::uuid[], $5::uuid[], $6::text[])
-             AS wanted(id, from_topic, to_topic, kind)
-          ORDER BY from_topic, to_topic, kind
-         ON CONFLICT (project_id, from_topic, to_topic, kind) DO NOTHING",
-    )
-    .bind(project.0)
-    .bind(now)
-    .bind(
-        indices
-            .iter()
-            .map(|_| RelationshipId::new().0)
-            .collect::<Vec<_>>(),
-    )
-    .bind(&from)
-    .bind(&to)
-    .bind(&kinds)
-    .execute(&mut **transaction)
-    .await?;
-
-    let locked: HashMap<(uuid::Uuid, uuid::Uuid, String), uuid::Uuid> = sqlx::query(
-        "SELECT r.id, r.from_topic, r.to_topic, r.kind
-           FROM relationships r
-           JOIN unnest($2::uuid[], $3::uuid[], $4::text[]) AS wanted(from_topic, to_topic, kind)
-             ON r.project_id = $1 AND r.from_topic = wanted.from_topic
-            AND r.to_topic = wanted.to_topic AND r.kind = wanted.kind
-          ORDER BY r.from_topic, r.to_topic, r.kind
-            FOR UPDATE OF r",
-    )
-    .bind(project.0)
-    .bind(&from)
-    .bind(&to)
-    .bind(&kinds)
-    .fetch_all(&mut **transaction)
-    .await?
-    .iter()
-    .map(|row| {
-        (
-            (row.get("from_topic"), row.get("to_topic"), row.get("kind")),
-            row.get("id"),
+    sqlx::query(include_str!("../sql/graph/insert_relationships.sql"))
+        .bind(project.0)
+        .bind(now)
+        .bind(
+            indices
+                .iter()
+                .map(|_| RelationshipId::new().0)
+                .collect::<Vec<_>>(),
         )
-    })
-    .collect();
+        .bind(&from)
+        .bind(&to)
+        .bind(&kinds)
+        .execute(&mut **transaction)
+        .await?;
+
+    let locked: HashMap<(uuid::Uuid, uuid::Uuid, String), uuid::Uuid> =
+        sqlx::query(include_str!("../sql/graph/lock_relationships.sql"))
+            .bind(project.0)
+            .bind(&from)
+            .bind(&to)
+            .bind(&kinds)
+            .fetch_all(&mut **transaction)
+            .await?
+            .iter()
+            .map(|row| {
+                (
+                    (row.get("from_topic"), row.get("to_topic"), row.get("kind")),
+                    row.get("id"),
+                )
+            })
+            .collect();
     // Every identity was created or found above, so one missing now was
     // removed in between -- its topic deleted -- which the single-edge lock
     // reported the same way.
@@ -489,12 +427,8 @@ async fn assert_within(
         })
         .collect::<std::result::Result<_, _>>()?;
 
-    let live: HashMap<uuid::Uuid, RelationshipVersion> = sqlx::query(concat!(
-        "SELECT DISTINCT ON (relationship_id) ",
-        version_columns!(),
-        " FROM relationship_versions
-          WHERE relationship_id = ANY($1) AND invalidated_at IS NULL
-          ORDER BY relationship_id, version DESC"
+    let live: HashMap<uuid::Uuid, RelationshipVersion> = sqlx::query(include_str!(
+        "../sql/graph/live_versions_for_relationships.sql"
     ))
     .bind(&identities)
     .fetch_all(&mut **transaction)
@@ -537,33 +471,8 @@ async fn assert_within(
     }
 
     if !appending.at.is_empty() {
-        let appended: HashMap<uuid::Uuid, RelationshipVersion> = sqlx::query(concat!(
-            "WITH claim AS (
-                 SELECT * FROM unnest(
-                     $3::uuid[], $4::uuid[], $5::uuid[], $6::timestamptz[], $7::timestamptz[],
-                     $8::uuid[], $9::real[], $10::text[], $11::uuid[], $12::uuid[], $13::text[]
-                 ) AS claim(id, relationship_id, supersedes, valid_from, valid_to,
-                            caused_by, confidence, derivation, from_topic, to_topic, kind)
-             ), closed AS (
-                 UPDATE relationship_versions
-                    SET invalidated_at = $2, tombstone_reason = $14
-                   FROM claim WHERE relationship_versions.id = claim.supersedes
-             )
-             INSERT INTO relationship_versions (
-                 id, project_id, relationship_id, version, valid_from, valid_to,
-                 created_at, supersedes, caused_by_topic_state, confidence, derivation,
-                 from_topic, to_topic, kind
-             )
-             SELECT claim.id, $1, claim.relationship_id,
-                    COALESCE((SELECT MAX(version) FROM relationship_versions
-                               WHERE project_id = $1
-                                 AND relationship_id = claim.relationship_id), 0) + 1,
-                    claim.valid_from, claim.valid_to, $2, claim.supersedes, claim.caused_by,
-                    claim.confidence, claim.derivation, claim.from_topic, claim.to_topic,
-                    claim.kind
-               FROM claim
-             RETURNING ",
-            version_columns!()
+        let appended: HashMap<uuid::Uuid, RelationshipVersion> = sqlx::query(include_str!(
+            "../sql/graph/append_relationship_versions.sql"
         ))
         .bind(project.0)
         .bind(now)
@@ -640,38 +549,17 @@ pub async fn retract_derived_all(
     // and only those with something to close -- so restating a memory that
     // still names everything it did locks nothing. See `close_edge` for why a
     // version is written only under its identity's lock.
-    let closed = sqlx::query(
-        "WITH doomed AS (
-             SELECT r.id FROM relationships r
-              WHERE r.project_id = $4 AND r.from_topic = ANY($5) AND r.kind = $6
-                AND NOT EXISTS (
-                    SELECT 1 FROM unnest($7::uuid[], $8::uuid[]) AS kept (from_topic, to_topic)
-                     WHERE kept.from_topic = r.from_topic AND kept.to_topic = r.to_topic
-                )
-                AND EXISTS (
-                    SELECT 1 FROM relationship_versions v
-                     WHERE v.relationship_id = r.id AND v.invalidated_at IS NULL
-                       AND v.derivation = $3
-                )
-              ORDER BY r.from_topic, r.to_topic, r.kind
-                FOR UPDATE OF r
-         )
-         UPDATE relationship_versions
-            SET invalidated_at = $1, tombstone_reason = $2
-          WHERE invalidated_at IS NULL
-            AND derivation = $3
-            AND relationship_id IN (SELECT id FROM doomed)",
-    )
-    .bind(OffsetDateTime::now_utc())
-    .bind(TombstoneReason::Closed.label())
-    .bind(Derivation::Deterministic.label())
-    .bind(project.0)
-    .bind(&froms)
-    .bind(kind.label())
-    .bind(&kept_from)
-    .bind(&kept_to)
-    .execute(executor)
-    .await?;
+    let closed = sqlx::query(include_str!("../sql/graph/retract_derived_all.sql"))
+        .bind(OffsetDateTime::now_utc())
+        .bind(TombstoneReason::Closed.label())
+        .bind(Derivation::Deterministic.label())
+        .bind(project.0)
+        .bind(&froms)
+        .bind(kind.label())
+        .bind(&kept_from)
+        .bind(&kept_to)
+        .execute(executor)
+        .await?;
 
     Ok(closed.rows_affected())
 }
@@ -692,19 +580,13 @@ pub async fn targets(
         return Ok(Vec::new());
     }
     let ids: Vec<uuid::Uuid> = from.iter().map(|topic| topic.0).collect();
-    let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
-        "SELECT r.from_topic, r.to_topic FROM relationships r
-          WHERE r.project_id = $1 AND r.from_topic = ANY($2) AND r.kind = $3
-            AND EXISTS (
-                SELECT 1 FROM relationship_versions v
-                 WHERE v.relationship_id = r.id AND v.invalidated_at IS NULL
-            )",
-    )
-    .bind(project.0)
-    .bind(&ids)
-    .bind(kind.label())
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(uuid::Uuid, uuid::Uuid)> =
+        sqlx::query_as(include_str!("../sql/graph/targets.sql"))
+            .bind(project.0)
+            .bind(&ids)
+            .bind(kind.label())
+            .fetch_all(executor)
+            .await?;
     Ok(rows
         .into_iter()
         .map(|(from, to)| (from.into(), to.into()))
@@ -732,25 +614,15 @@ pub async fn close_edge(
     // writer of an edge's versions now does, in one order -- means nobody
     // waits for a version's row: whoever holds its identity is the only one
     // who can be writing it.
-    let affected = sqlx::query(
-        "WITH edge AS (
-             SELECT id FROM relationships
-              WHERE project_id = $3 AND from_topic = $4 AND to_topic = $5 AND kind = $6
-                FOR UPDATE
-         )
-         UPDATE relationship_versions
-            SET invalidated_at = $1, tombstone_reason = $2
-          WHERE invalidated_at IS NULL
-            AND relationship_id IN (SELECT id FROM edge)",
-    )
-    .bind(OffsetDateTime::now_utc())
-    .bind(reason.label())
-    .bind(project.0)
-    .bind(from.0)
-    .bind(to.0)
-    .bind(kind.label())
-    .execute(executor)
-    .await?;
+    let affected = sqlx::query(include_str!("../sql/graph/close_edge.sql"))
+        .bind(OffsetDateTime::now_utc())
+        .bind(reason.label())
+        .bind(project.0)
+        .bind(from.0)
+        .bind(to.0)
+        .bind(kind.label())
+        .execute(executor)
+        .await?;
 
     Ok(affected.rows_affected() > 0)
 }
@@ -904,23 +776,6 @@ impl Expansion<'_> {
     }
 }
 
-/// The edges incident on a frontier, `$2`, of the kinds in `$3` (all of them
-/// when it is null), before the question of which versions count.
-///
-/// The version is joined on its project as well as its relationship, which is
-/// the prefix of its unique key.
-macro_rules! edges_touching {
-    () => {
-        "SELECT r.from_topic, r.to_topic, r.kind, v.confidence, v.derivation
-         FROM relationships r
-         JOIN relationship_versions v
-           ON v.project_id = r.project_id AND v.relationship_id = r.id
-         WHERE r.project_id = $1
-           AND (r.from_topic = ANY($2) OR r.to_topic = ANY($2))
-           AND ($3::TEXT[] IS NULL OR r.kind = ANY ($3))"
-    };
-}
-
 /// The `$4` strongest live edges each way of every topic in `$2`, of the kinds
 /// in `$3` (all of them when it is null).
 ///
@@ -937,30 +792,7 @@ macro_rules! edges_touching {
 /// index's own predicate, `invalidated_at IS NULL`, for the reason the live
 /// statement below says it: a generic plan can only use a partial index whose
 /// predicate the statement states.
-const STRONGEST: &str = "
-    SELECT p.topic AS standing, TRUE AS outward,
-           e.from_topic, e.to_topic, e.kind, e.confidence, e.derivation
-      FROM unnest($2::uuid[]) AS p (topic)
-     CROSS JOIN LATERAL (
-           SELECT v.from_topic, v.to_topic, v.kind, v.confidence, v.derivation
-             FROM relationship_versions v
-            WHERE v.project_id = $1 AND v.from_topic = p.topic
-              AND v.invalidated_at IS NULL
-              AND ($3::TEXT[] IS NULL OR v.kind = ANY ($3))
-            ORDER BY v.confidence DESC, v.to_topic
-            LIMIT $4) e
-    UNION ALL
-    SELECT p.topic, FALSE,
-           e.from_topic, e.to_topic, e.kind, e.confidence, e.derivation
-      FROM unnest($2::uuid[]) AS p (topic)
-     CROSS JOIN LATERAL (
-           SELECT v.from_topic, v.to_topic, v.kind, v.confidence, v.derivation
-             FROM relationship_versions v
-            WHERE v.project_id = $1 AND v.to_topic = p.topic
-              AND v.invalidated_at IS NULL
-              AND ($3::TEXT[] IS NULL OR v.kind = ANY ($3))
-            ORDER BY v.confidence DESC, v.from_topic
-            LIMIT $4) e";
+const STRONGEST: &str = include_str!("../sql/graph/strongest_edges.sql");
 
 /// Every live edge between a topic in `$2` and a topic in `$3`, either way
 /// round, of the kinds in `$4`.
@@ -968,16 +800,7 @@ const STRONGEST: &str = "
 /// Through the identity's unique key, `(project_id, from_topic, to_topic,
 /// kind)`, so this costs the pairs asked about and not the degree of the hub
 /// that made them worth asking about.
-const BETWEEN: &str = "
-    SELECT r.from_topic, r.to_topic, r.kind, v.confidence, v.derivation
-      FROM relationships r
-      JOIN relationship_versions v
-        ON v.project_id = r.project_id AND v.relationship_id = r.id
-     WHERE r.project_id = $1
-       AND ((r.from_topic = ANY ($2) AND r.to_topic = ANY ($3))
-         OR (r.to_topic = ANY ($2) AND r.from_topic = ANY ($3)))
-       AND ($4::TEXT[] IS NULL OR r.kind = ANY ($4))
-       AND v.invalidated_at IS NULL";
+const BETWEEN: &str = include_str!("../sql/graph/edges_between.sql");
 
 /// One live edge, as a hop reads it.
 #[derive(Clone, Copy)]
@@ -1059,14 +882,8 @@ async fn every_edge(
     // superseded one is answered by its successor. That distinction is what
     // tombstone_reason records, and ignoring it made every retraction erase
     // its own history.
-    const LIVE: &str = concat!(edges_touching!(), " AND v.invalidated_at IS NULL");
-    const AT: &str = concat!(
-        edges_touching!(),
-        " AND (v.valid_from IS NULL OR v.valid_from <= $4)
-          AND (v.valid_to IS NULL OR $4 < v.valid_to)
-          AND (v.invalidated_at IS NULL
-               OR (v.tombstone_reason = 'closed' AND $4 < v.invalidated_at))"
-    );
+    const LIVE: &str = include_str!("../sql/graph/live_edges_touching.sql");
+    const AT: &str = include_str!("../sql/graph/edges_touching_at.sql");
     let query = sqlx::query(if at.is_some() { AT } else { LIVE })
         .bind(project.0)
         .bind(positions)

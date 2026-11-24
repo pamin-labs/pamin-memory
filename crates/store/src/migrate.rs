@@ -15,122 +15,132 @@
 use std::borrow::Cow;
 
 use sqlx::PgPool;
+use sqlx::SqlStr;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
-use sqlx::{AssertSqlSafe, SqlSafeStr, SqlStr};
 
 use crate::error::Result;
 
 /// The table `refinery` recorded applied migrations in, before `sqlx`.
 const APPLIED_BY_REFINERY: &str = "refinery_schema_history";
 
-/// What every migration runs first; see [`migration`].
-const ROW_SECURITY_OFF: &str = "SET LOCAL row_security = off;\n";
+// Embed the execution SQL with its transaction-local prologue, and keep the
+// original migration SQL for the checksum.
+macro_rules! embed_migration {
+    ($version:literal, $description:literal, $sql:expr $(,)?) => {
+        migration(
+            $version,
+            $description,
+            $sql,
+            concat!(include_str!("../sql/migrate/row_security_off.sql"), $sql),
+        )
+    };
+}
 
 /// Every migration, oldest first.
 fn migrations() -> Vec<Migration> {
     vec![
-        migration(1, "initial", include_str!("../migrations/V1__initial.sql")),
-        migration(
+        embed_migration!(1, "initial", include_str!("../migrations/V1__initial.sql")),
+        embed_migration!(
             2,
             "relationships",
             include_str!("../migrations/V2__relationships.sql"),
         ),
-        migration(
+        embed_migration!(
             3,
             "shard_key_and_indexes",
             include_str!("../migrations/V3__shard_key_and_indexes.sql"),
         ),
-        migration(
+        embed_migration!(
             4,
             "current_state_pointer",
             include_str!("../migrations/V4__current_state_pointer.sql"),
         ),
-        migration(
+        embed_migration!(
             5,
             "cascade_outbox",
             include_str!("../migrations/V5__cascade_outbox.sql"),
         ),
-        migration(
+        embed_migration!(
             6,
             "topic_name_index",
             include_str!("../migrations/V6__topic_name_index.sql"),
         ),
-        migration(
+        embed_migration!(
             7,
             "one_document_per_topic",
             include_str!("../migrations/V7__one_document_per_topic.sql"),
         ),
-        migration(
+        embed_migration!(
             8,
             "topics_by_recency",
             include_str!("../migrations/V8__topics_by_recency.sql"),
         ),
-        migration(
+        embed_migration!(
             9,
             "state_content_from_span",
             include_str!("../migrations/V9__state_content_from_span.sql"),
         ),
-        migration(
+        embed_migration!(
             10,
             "settled_jobs_leave",
             include_str!("../migrations/V10__settled_jobs_leave.sql"),
         ),
-        migration(
+        embed_migration!(
             11,
             "retrieval_signals_leave",
             include_str!("../migrations/V11__retrieval_signals_leave.sql"),
         ),
-        migration(
+        embed_migration!(
             12,
             "job_subject_once",
             include_str!("../migrations/V12__job_subject_once.sql"),
         ),
-        migration(
+        embed_migration!(
             13,
             "edge_endpoints_on_versions",
             include_str!("../migrations/V13__edge_endpoints_on_versions.sql"),
         ),
-        migration(
+        embed_migration!(
             14,
             "source_versions_index_once",
             include_str!("../migrations/V14__source_versions_index_once.sql"),
         ),
-        migration(
+        embed_migration!(
             15,
             "source_kind_known",
             include_str!("../migrations/V15__source_kind_known.sql"),
         ),
-        migration(
+        embed_migration!(
             16,
             "file_source_root",
             include_str!("../migrations/V16__file_source_root.sql"),
         ),
-        migration(
+        embed_migration!(
             17,
             "topic_aliases",
             include_str!("../migrations/V17__topic_aliases.sql"),
         ),
-        migration(
+        embed_migration!(
             18,
             "file_records",
             include_str!("../migrations/V18__file_records.sql"),
         ),
-        migration(
+        embed_migration!(
             19,
             "synced_paths",
             include_str!("../migrations/V19__synced_paths.sql"),
         ),
-        migration(
+        embed_migration!(
             20,
             "row_level_security",
             include_str!("../migrations/V20__row_level_security.sql"),
         ),
-        migration(
+        embed_migration!(
             21,
             "force_row_level_security",
             include_str!("../migrations/V21__force_row_level_security.sql"),
         ),
-        migration(
+        embed_migration!(
             22,
             "span_vectors",
             include_str!("../migrations/V22__span_vectors.sql"),
@@ -138,7 +148,12 @@ fn migrations() -> Vec<Migration> {
     ]
 }
 
-fn migration(version: i64, description: &'static str, sql: &'static str) -> Migration {
+fn migration(
+    version: i64,
+    description: &'static str,
+    sql: &'static str,
+    execution_sql: &'static str,
+) -> Migration {
     let mut migration = Migration::new(
         version,
         Cow::Borrowed(description),
@@ -162,7 +177,7 @@ fn migration(version: i64, description: &'static str, sql: &'static str) -> Migr
     // next transaction may run on another server connection, and this one goes
     // back to whoever is next. The checksum stays the file's, computed above,
     // so the history a database already recorded still matches.
-    migration.sql = AssertSqlSafe(format!("{ROW_SECURITY_OFF}{sql}")).into_sql_str();
+    migration.sql = SqlStr::from_static(execution_sql);
     migration
 }
 
@@ -229,17 +244,16 @@ pub async fn ensure_current(pool: &PgPool) -> Result<()> {
 /// Read from the table `sqlx` keeps, which a database nothing has migrated does
 /// not have yet: then every migration is pending.
 async fn pending(pool: &PgPool, migrations: &[Migration]) -> Result<Vec<i64>> {
-    let applied: Vec<i64> =
-        match sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
-            .fetch_all(pool)
-            .await
-        {
-            Ok(applied) => applied,
-            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
-                Vec::new()
-            }
-            Err(error) => return Err(error.into()),
-        };
+    let applied: Vec<i64> = match sqlx::query_scalar(include_str!(
+        "../sql/migrate/successful_migration_versions.sql"
+    ))
+    .fetch_all(pool)
+    .await
+    {
+        Ok(applied) => applied,
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
 
     Ok(migrations
         .iter()
@@ -270,27 +284,19 @@ async fn adopt_refinery_history(pool: &PgPool, migrations: &[Migration]) -> Resu
 
     // The same shape `sqlx` creates, because it is about to find it already
     // there and go on to read it.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-             version        BIGINT PRIMARY KEY,
-             description    TEXT NOT NULL,
-             installed_on   TIMESTAMPTZ NOT NULL DEFAULT now(),
-             success        BOOLEAN NOT NULL,
-             checksum       BYTEA NOT NULL,
-             execution_time BIGINT NOT NULL
-         )",
-    )
-    .execute(pool)
-    .await?;
-
-    let (recorded,): (i64,) = sqlx::query_as("SELECT count(*) FROM _sqlx_migrations")
-        .fetch_one(pool)
+    sqlx::query(include_str!("../sql/migrate/create_migration_history.sql"))
+        .execute(pool)
         .await?;
+
+    let (recorded,): (i64,) =
+        sqlx::query_as(include_str!("../sql/migrate/count_recorded_migrations.sql"))
+            .fetch_one(pool)
+            .await?;
     if recorded > 0 {
         return Ok(());
     }
 
-    let applied: Vec<i64> = sqlx::query_as("SELECT version FROM refinery_schema_history")
+    let applied: Vec<i64> = sqlx::query_as(include_str!("../sql/migrate/refinery_versions.sql"))
         .fetch_all(pool)
         .await?
         .into_iter()
@@ -302,17 +308,12 @@ async fn adopt_refinery_history(pool: &PgPool, migrations: &[Migration]) -> Resu
             continue;
         }
 
-        sqlx::query(
-            "INSERT INTO _sqlx_migrations
-                 (version, description, success, checksum, execution_time)
-             VALUES ($1, $2, TRUE, $3, -1)
-             ON CONFLICT (version) DO NOTHING",
-        )
-        .bind(migration.version)
-        .bind(migration.description.as_ref())
-        .bind(migration.checksum.as_ref())
-        .execute(pool)
-        .await?;
+        sqlx::query(include_str!("../sql/migrate/record_adopted_migration.sql"))
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(pool)
+            .await?;
 
         tracing::info!(
             version = migration.version,
@@ -329,15 +330,10 @@ async fn adopt_refinery_history(pool: &PgPool, migrations: &[Migration]) -> Resu
 /// Through `information_schema` rather than `to_regclass`, which is one engine's
 /// spelling of the same question.
 async fn table_exists(pool: &PgPool, name: &str) -> Result<bool> {
-    let (exists,): (bool,) = sqlx::query_as(
-        "SELECT EXISTS (
-             SELECT 1 FROM information_schema.tables
-             WHERE table_schema = current_schema() AND table_name = $1
-         )",
-    )
-    .bind(name)
-    .fetch_one(pool)
-    .await?;
+    let (exists,): (bool,) = sqlx::query_as(include_str!("../sql/migrate/table_exists.sql"))
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
 
     Ok(exists)
 }
@@ -466,7 +462,7 @@ mod tests {
             let file = migration
                 .sql
                 .as_str()
-                .strip_prefix(super::ROW_SECURITY_OFF)
+                .strip_prefix(include_str!("../sql/migrate/row_security_off.sql"))
                 .unwrap_or_else(|| panic!("V{} runs with row security on", migration.version));
             let unprefixed = Migration::new(
                 migration.version,

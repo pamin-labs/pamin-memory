@@ -81,17 +81,12 @@ pub async fn ensure_project(pool: &PgPool, name: &str) -> Result<Project> {
     if let Some(project) = find_project(pool, name).await? {
         return Ok(project);
     }
-    let inserted = sqlx::query(
-        "INSERT INTO projects (id, name, created_at)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (name) DO NOTHING
-         RETURNING id, name, created_at",
-    )
-    .bind(ProjectId::new().0)
-    .bind(name)
-    .bind(OffsetDateTime::now_utc())
-    .fetch_optional(pool)
-    .await?;
+    let inserted = sqlx::query(include_str!("../sql/repository/ensure_project.sql"))
+        .bind(ProjectId::new().0)
+        .bind(name)
+        .bind(OffsetDateTime::now_utc())
+        .fetch_optional(pool)
+        .await?;
     match inserted {
         Some(row) => Ok(project_from(&row)),
         // Another writer created it in between.
@@ -103,7 +98,7 @@ pub async fn ensure_project(pool: &PgPool, name: &str) -> Result<Project> {
 
 /// The project with this name, if there is one.
 pub async fn find_project(pool: &PgPool, name: &str) -> Result<Option<Project>> {
-    let row = sqlx::query("SELECT id, name, created_at FROM projects WHERE name = $1")
+    let row = sqlx::query(include_str!("../sql/repository/find_project.sql"))
         .bind(name)
         .fetch_optional(pool)
         .await?;
@@ -142,18 +137,11 @@ pub async fn purge_project(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<Option<PurgedProject>> {
-    let row: Option<(uuid::Uuid, i64, i64, Vec<String>)> = sqlx::query_as(
-        "WITH gone AS (DELETE FROM projects WHERE id = $1 RETURNING id)
-         SELECT gone.id,
-                (SELECT count(*) FROM topics WHERE project_id = gone.id),
-                (SELECT count(*) FROM sources WHERE project_id = gone.id),
-                ARRAY(SELECT path FROM synced_paths
-                       WHERE project_id = gone.id ORDER BY path)
-           FROM gone",
-    )
-    .bind(project.0)
-    .fetch_optional(executor)
-    .await?;
+    let row: Option<(uuid::Uuid, i64, i64, Vec<String>)> =
+        sqlx::query_as(include_str!("../sql/repository/purge_project.sql"))
+            .bind(project.0)
+            .fetch_optional(executor)
+            .await?;
     Ok(row.map(|(id, topics, sources, synced)| PurgedProject {
         id: id.into(),
         topics: topics as u64,
@@ -198,29 +186,16 @@ pub async fn ensure_source_created(
     kind: SourceKind,
     locator: &str,
 ) -> Result<(SourceId, bool)> {
-    const FIND: &str = "SELECT id, false AS created FROM sources WHERE project_id = $1 AND locator = $2 FOR UPDATE";
+    const FIND: &str = include_str!("../sql/repository/lock_existing_source.sql");
 
-    let row = sqlx::query(
-        "WITH found AS (
-             SELECT id FROM sources WHERE project_id = $1 AND locator = $2 FOR UPDATE
-         ), inserted AS (
-             INSERT INTO sources (id, project_id, kind, locator, created_at)
-             SELECT $3, $1, $4, $2, $5
-              WHERE NOT EXISTS (SELECT 1 FROM found)
-             ON CONFLICT (project_id, locator) DO NOTHING
-             RETURNING id
-         )
-         SELECT id, false AS created FROM found
-         UNION ALL
-         SELECT id, true AS created FROM inserted",
-    )
-    .bind(project.0)
-    .bind(locator)
-    .bind(SourceId::new().0)
-    .bind(kind.label())
-    .bind(OffsetDateTime::now_utc())
-    .fetch_optional(&mut *connection)
-    .await?;
+    let row = sqlx::query(include_str!("../sql/repository/ensure_source.sql"))
+        .bind(project.0)
+        .bind(locator)
+        .bind(SourceId::new().0)
+        .bind(kind.label())
+        .bind(OffsetDateTime::now_utc())
+        .fetch_optional(&mut *connection)
+        .await?;
 
     let row = match row {
         Some(row) => row,
@@ -319,72 +294,6 @@ pub async fn append_promoted(
     Ok((version, span, state.expect("asked for the state")))
 }
 
-/// Numbers and inserts a source version, the query every append of evidence
-/// starts from.
-macro_rules! insert_source_version {
-    () => {
-        "INSERT INTO source_versions (
-             id, project_id, source_id, version, content, content_hash,
-             filter_decision, filter_reason, recorded_at
-         )
-         SELECT $1, $2, $3, COALESCE(MAX(version), 0) + 1, $4, $5, $6, $7, $8
-         FROM source_versions WHERE project_id = $2 AND source_id = $3
-         RETURNING id, version, recorded_at"
-    };
-}
-
-/// The span over the whole of the version the `version` query inserted.
-macro_rules! insert_whole_span {
-    () => {
-        "INSERT INTO source_spans (
-             id, project_id, source_version_id, byte_start, byte_end,
-             detected_language, language_confidence
-         )
-         SELECT $9, $2, version.id, 0, $10, $11, $12 FROM version"
-    };
-}
-
-/// A topic's next state and the topic's pointer to it, as the two `WITH`
-/// queries `state` and `pointer` of the statement that appends one.
-///
-/// The state and the pointer to it in one statement: the appended state is
-/// the newest surviving one by construction, so the pointer moves with it
-/// rather than being recomputed, and there is no moment at which the topic
-/// points at the state before this one. The arguments name the placeholders
-/// each value is bound to.
-#[rustfmt::skip] // One argument per line would bury the statement.
-macro_rules! append_state {
-    (
-        id = $id:literal,
-        project = $project:literal,
-        topic = $topic:literal,
-        span = $span:literal,
-        observed = $observed:literal,
-        recorded = $recorded:literal,
-        supersedes = $supersedes:literal,
-        valid_from = $from:literal,
-        valid_to = $to:literal $(,)?
-    ) => {
-        concat!(
-            "state AS (
-                 INSERT INTO topic_states (
-                     id, project_id, topic_id, version, source_span_id,
-                     observed_at, recorded_at, supersedes, valid_from, valid_to
-                 )
-                 SELECT ", $id, ", ", $project, ", ", $topic, ", COALESCE(MAX(version), 0) + 1,
-                        ", $span, ", ", $observed, ", ", $recorded, ", ", $supersedes, ",
-                        ", $from, ", ", $to, "
-                   FROM topic_states
-                  WHERE project_id = ", $project, " AND topic_id = ", $topic, "
-                 RETURNING id, version, recorded_at
-             ), pointer AS (
-                 UPDATE topics SET current_state_id = state.id, current_version = state.version
-                   FROM state WHERE topics.id = ", $topic, "
-             )"
-        )
-    };
-}
-
 /// The version, the span over all of it, and with a `promotion` the state cut
 /// from that span, written by one statement.
 async fn insert_evidence(
@@ -394,43 +303,8 @@ async fn insert_evidence(
     evidence: &Evidence<'_>,
     promotion: Option<&Promotion<'_>>,
 ) -> Result<(SourceVersion, SourceSpan, Option<TopicState>)> {
-    const WITH_SPAN: &str = concat!(
-        "WITH version AS (",
-        insert_source_version!(),
-        "), span AS (",
-        insert_whole_span!(),
-        ")
-         SELECT id, version, recorded_at FROM version"
-    );
-    const PROMOTED: &str = concat!(
-        "WITH version AS (",
-        insert_source_version!(),
-        "), span AS (",
-        insert_whole_span!(),
-        "), ",
-        append_state!(
-            id = "$13",
-            project = "$2",
-            topic = "$14",
-            span = "$9",
-            observed = "$15",
-            recorded = "$8",
-            supersedes = "$16",
-            valid_from = "$17",
-            valid_to = "$18",
-        ),
-        ", owed AS (",
-        crate::jobs::enqueue_jobs!(
-            project = "$2",
-            subject = "$14",
-            at = "$8",
-            rows = ["$19", "$20", "$21"]
-        ),
-        ")
-         SELECT version.id, version.version, version.recorded_at,
-                state.id AS state_id, state.version AS state_version
-           FROM version, state"
-    );
+    const WITH_SPAN: &str = include_str!("../sql/repository/insert_evidence.sql");
+    const PROMOTED: &str = include_str!("../sql/repository/insert_promoted_evidence.sql");
 
     let span_id = SourceSpanId::new();
     let byte_end = evidence.content.len() as u32;
@@ -513,9 +387,7 @@ pub struct LockedTopic {
     pub current: Option<TopicStateId>,
 }
 
-const LOCK_TOPIC: &str = "SELECT id, name, path, created_at, current_state_id FROM topics
-                          WHERE project_id = $1 AND name = $2
-                          FOR UPDATE";
+const LOCK_TOPIC: &str = include_str!("../sql/repository/lock_topic_by_name.sql");
 
 /// Finds a topic by name and locks it, reading its current state under the
 /// lock. `None` when no topic has the name, and then nothing is locked.
@@ -579,18 +451,14 @@ pub async fn name_topic(
     key: &str,
     tokens: usize,
 ) -> Result<Option<TopicId>> {
-    let inserted: Option<(uuid::Uuid,)> = sqlx::query_as(
-        "INSERT INTO topic_name_tokens (project_id, topic_id, name_key, token_count)
-         SELECT project_id, id, $3, $4 FROM topics WHERE project_id = $1 AND name = $2
-         ON CONFLICT (project_id, topic_id) DO NOTHING
-         RETURNING topic_id",
-    )
-    .bind(project.0)
-    .bind(name)
-    .bind(key)
-    .bind(i16::try_from(tokens).unwrap_or(i16::MAX))
-    .fetch_optional(executor)
-    .await?;
+    let inserted: Option<(uuid::Uuid,)> =
+        sqlx::query_as(include_str!("../sql/repository/name_topic.sql"))
+            .bind(project.0)
+            .bind(name)
+            .bind(key)
+            .bind(i16::try_from(tokens).unwrap_or(i16::MAX))
+            .fetch_optional(executor)
+            .await?;
     Ok(inserted.map(|(topic,)| topic.into()))
 }
 
@@ -617,26 +485,15 @@ async fn create_topic(
     name: &str,
     named: Option<(&str, usize)>,
 ) -> Result<LockedTopic> {
-    let inserted = sqlx::query(
-        "WITH topic AS (
-             INSERT INTO topics (id, project_id, name, created_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (project_id, name) DO NOTHING
-             RETURNING id, name, path, created_at, current_state_id
-         ), named AS (
-             INSERT INTO topic_name_tokens (project_id, topic_id, name_key, token_count)
-             SELECT $2, id, $5, $6 FROM topic WHERE $5::text IS NOT NULL
-         )
-         SELECT id, name, path, created_at, current_state_id FROM topic",
-    )
-    .bind(TopicId::new().0)
-    .bind(project.0)
-    .bind(name)
-    .bind(OffsetDateTime::now_utc())
-    .bind(named.map(|(key, _)| key))
-    .bind(named.map(|(_, tokens)| tokens as i16))
-    .fetch_optional(&mut *connection)
-    .await?;
+    let inserted = sqlx::query(include_str!("../sql/repository/create_topic.sql"))
+        .bind(TopicId::new().0)
+        .bind(project.0)
+        .bind(name)
+        .bind(OffsetDateTime::now_utc())
+        .bind(named.map(|(key, _)| key))
+        .bind(named.map(|(_, tokens)| tokens as i16))
+        .fetch_optional(&mut *connection)
+        .await?;
 
     let row = match inserted {
         Some(row) => row,
@@ -675,7 +532,7 @@ async fn point_at(
     topic: TopicId,
     state: Option<&TopicState>,
 ) -> Result<()> {
-    sqlx::query("UPDATE topics SET current_state_id = $2, current_version = $3 WHERE id = $1")
+    sqlx::query(include_str!("../sql/repository/point_at.sql"))
         .bind(topic.0)
         .bind(state.map(|state| state.id.0))
         .bind(state.map(|state| to_sql_version(state.version)))
@@ -713,8 +570,7 @@ fn span_text(evidence: &str, byte_start: u32, byte_end: u32) -> &str {
     &evidence[byte_start as usize..byte_end as usize]
 }
 
-/// A state's content, cut from the evidence the row joined in through
-/// `span_columns!`.
+/// A state's content, cut from the evidence joined through its source span.
 ///
 /// Every span the write path records covers its evidence whole, so the usual
 /// case hands the string over rather than copying it.
@@ -731,93 +587,16 @@ fn content_of_span(row: &PgRow) -> String {
     }
 }
 
-/// The span columns every state read needs, spelled the way every statement
-/// below spells them: its language, and the evidence its content is cut from.
-///
-/// `topic_states.source_span_id` is `NOT NULL` and references `source_spans`,
-/// which references `source_versions` the same way, so the inner joins that
-/// bring these in cannot drop a state. What is nullable is the language:
-/// detection declines on content too short to be sure about.
-///
-/// Both joins are on a primary key. The first was measured on
-/// `current_states_of` at its hundred-and-fifty-candidate ceiling, same rows,
-/// same process, alternating: 1.00 ms median without it and 1.04 ms with, over
-/// three runs. The second costs more, because it is where the text is read:
-/// on XQuAD-R's 2,640 paragraphs, builds before and after it alternated over
-/// five rounds, `current_states_of` at 150 topics went from 1.70 ms to 2.06.
-/// That is the price of keeping each memory's text once; `docs/measured.md`
-/// has the rest.
-macro_rules! span_columns {
-    () => {
-        ", sp.detected_language, sp.byte_start, sp.byte_end, sv.content AS evidence"
-    };
-}
-
-/// The joins `span_columns!` reads from, off a `topic_states` aliased `ts`.
-macro_rules! span_joins {
-    () => {
-        " JOIN source_spans sp ON sp.id = ts.source_span_id
-          JOIN source_versions sv ON sv.id = sp.source_version_id"
-    };
-}
-
-/// The columns `row_to_topic_state` reads from `topic_states` itself.
-///
-/// A macro rather than a constant so the statements below can be assembled with
-/// `concat!` and stay `&'static str`. sqlx accepts only a statement that is
-/// static or explicitly asserted safe, which is a deliberate obstacle in front
-/// of building SQL with `format!`; this keeps the column list in one place
-/// without stepping over it.
-///
-/// Takes the table's alias, because every statement below joins `source_spans`
-/// -- which has its own `id` and `project_id` -- and an unqualified list is
-/// ambiguous there. PostgreSQL raises that at execution, so only a query that
-/// actually runs finds it.
-///
-/// The content is not in here. It is the span's text, so it comes from the
-/// evidence through `span_columns!`.
-macro_rules! state_columns {
-    ($alias:literal) => {
-        concat!(
-            $alias,
-            "id, ",
-            $alias,
-            "project_id, ",
-            $alias,
-            "topic_id, ",
-            $alias,
-            "version, ",
-            $alias,
-            "source_span_id, ",
-            $alias,
-            "observed_at, ",
-            $alias,
-            "recorded_at, ",
-            $alias,
-            "valid_from, ",
-            $alias,
-            "valid_to, ",
-            $alias,
-            "supersedes, ",
-            $alias,
-            "deleted_at"
-        )
-    };
-}
-
 /// Returns a topic's undeleted version numbers, oldest first.
 ///
 /// This is what version resolution runs against, so soft-deleted versions are
 /// excluded here rather than filtered afterwards.
 pub async fn topic_versions(executor: impl PgExecutor<'_>, topic: TopicId) -> Result<Vec<u32>> {
-    let versions: Vec<(i32,)> = sqlx::query_as(
-        "SELECT version FROM topic_states
-         WHERE topic_id = $1 AND deleted_at IS NULL
-         ORDER BY version ASC",
-    )
-    .bind(topic.0)
-    .fetch_all(executor)
-    .await?;
+    let versions: Vec<(i32,)> =
+        sqlx::query_as(include_str!("../sql/repository/topic_versions.sql"))
+            .bind(topic.0)
+            .fetch_all(executor)
+            .await?;
 
     Ok(versions
         .into_iter()
@@ -836,19 +615,12 @@ pub async fn topic_state(
     topic: TopicId,
     version: u32,
 ) -> Result<Option<TopicState>> {
-    let row = sqlx::query(concat!(
-        "SELECT ",
-        state_columns!("ts."),
-        span_columns!(),
-        " FROM topic_states ts",
-        span_joins!(),
-        " WHERE ts.project_id = $1 AND ts.topic_id = $2 AND ts.version = $3"
-    ))
-    .bind(project.0)
-    .bind(topic.0)
-    .bind(to_sql_version(version))
-    .fetch_optional(executor)
-    .await?;
+    let row = sqlx::query(include_str!("../sql/repository/topic_state.sql"))
+        .bind(project.0)
+        .bind(topic.0)
+        .bind(to_sql_version(version))
+        .fetch_optional(executor)
+        .await?;
 
     Ok(row.as_ref().map(row_to_topic_state))
 }
@@ -863,15 +635,8 @@ pub async fn all_current_topic_states(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<Vec<TopicState>> {
-    let rows = sqlx::query(concat!(
-        "SELECT ",
-        state_columns!("ts."),
-        span_columns!(),
-        " FROM topics
-          JOIN topic_states ts ON ts.id = topics.current_state_id",
-        span_joins!(),
-        " WHERE topics.project_id = $1 AND ts.deleted_at IS NULL
-          ORDER BY ts.topic_id ASC"
+    let rows = sqlx::query(include_str!(
+        "../sql/repository/all_current_topic_states.sql"
     ))
     .bind(project.0)
     .fetch_all(executor)
@@ -891,15 +656,11 @@ pub async fn current_topic_ids(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<Vec<TopicId>> {
-    let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT topics.id FROM topics
-          JOIN topic_states ts ON ts.id = topics.current_state_id
-          WHERE topics.project_id = $1 AND ts.deleted_at IS NULL
-          ORDER BY topics.id ASC",
-    )
-    .bind(project.0)
-    .fetch_all(executor)
-    .await?;
+    let ids: Vec<uuid::Uuid> =
+        sqlx::query_scalar(include_str!("../sql/repository/current_topic_ids.sql"))
+            .bind(project.0)
+            .fetch_all(executor)
+            .await?;
 
     Ok(ids.into_iter().map(TopicId::from).collect())
 }
@@ -941,20 +702,11 @@ pub async fn current_states_named(
     }
 
     let ids: Vec<uuid::Uuid> = topics.iter().map(|topic| topic.0).collect();
-    let rows = sqlx::query(concat!(
-        "SELECT ",
-        state_columns!("ts."),
-        span_columns!(),
-        ", t.name AS topic_name
-          FROM topic_states ts
-          JOIN topics t ON t.current_state_id = ts.id",
-        span_joins!(),
-        " WHERE t.project_id = $1 AND t.id = ANY($2)"
-    ))
-    .bind(project.0)
-    .bind(&ids)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/current_states_named.sql"))
+        .bind(project.0)
+        .bind(&ids)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -983,17 +735,11 @@ pub async fn current_content(
     project: ProjectId,
     name: &str,
 ) -> Result<Option<String>> {
-    let row = sqlx::query(concat!(
-        "SELECT sp.byte_start, sp.byte_end, sv.content AS evidence
-           FROM topics t
-           JOIN topic_states ts ON ts.id = t.current_state_id",
-        span_joins!(),
-        " WHERE t.project_id = $1 AND t.name = $2"
-    ))
-    .bind(project.0)
-    .bind(name)
-    .fetch_optional(executor)
-    .await?;
+    let row = sqlx::query(include_str!("../sql/repository/current_content.sql"))
+        .bind(project.0)
+        .bind(name)
+        .fetch_optional(executor)
+        .await?;
 
     Ok(row.as_ref().map(content_of_span))
 }
@@ -1013,14 +759,11 @@ pub async fn topics_by_id(
     }
 
     let ids: Vec<uuid::Uuid> = topics.iter().map(|topic| topic.0).collect();
-    let rows = sqlx::query(
-        "SELECT id, name, current_state_id FROM topics
-         WHERE project_id = $1 AND id = ANY($2)",
-    )
-    .bind(project.0)
-    .bind(&ids)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/topics_by_id.sql"))
+        .bind(project.0)
+        .bind(&ids)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -1047,15 +790,14 @@ pub async fn soft_delete_topic_state(
     topic: TopicId,
     version: u32,
 ) -> Result<bool> {
-    sqlx::query("SELECT id FROM topics WHERE id = $1 FOR UPDATE")
+    sqlx::query(include_str!("../sql/repository/lock_topic_by_id.sql"))
         .bind(topic.0)
         .execute(&mut *connection)
         .await?;
 
-    let affected = sqlx::query(
-        "UPDATE topic_states SET deleted_at = $3
-         WHERE topic_id = $1 AND version = $2 AND deleted_at IS NULL",
-    )
+    let affected = sqlx::query(include_str!(
+        "../sql/repository/soft_delete_topic_state.sql"
+    ))
     .bind(topic.0)
     .bind(to_sql_version(version))
     .bind(OffsetDateTime::now_utc())
@@ -1070,20 +812,12 @@ pub async fn soft_delete_topic_state(
     // need not have been the current one, and the version before it need not
     // have survived either. This asks the ledger the same question the pointer
     // is an answer to.
-    let surviving = sqlx::query(concat!(
-        "SELECT ",
-        state_columns!("ts."),
-        span_columns!(),
-        " FROM topic_states ts",
-        span_joins!(),
-        " WHERE ts.topic_id = $1 AND ts.deleted_at IS NULL
-          ORDER BY ts.version DESC LIMIT 1"
-    ))
-    .bind(topic.0)
-    .fetch_optional(&mut *connection)
-    .await?
-    .as_ref()
-    .map(row_to_topic_state);
+    let surviving = sqlx::query(include_str!("../sql/repository/newest_surviving_state.sql"))
+        .bind(topic.0)
+        .fetch_optional(&mut *connection)
+        .await?
+        .as_ref()
+        .map(row_to_topic_state);
 
     point_at(connection, topic, surviving.as_ref()).await?;
 
@@ -1106,19 +840,16 @@ pub async fn retire_topic(
     project: ProjectId,
     topic: TopicId,
 ) -> Result<bool> {
-    sqlx::query("SELECT id FROM topics WHERE id = $1 FOR UPDATE")
+    sqlx::query(include_str!("../sql/repository/lock_topic_by_id.sql"))
         .bind(topic.0)
         .execute(&mut *connection)
         .await?;
 
-    let affected = sqlx::query(
-        "UPDATE topic_states SET deleted_at = $2
-         WHERE topic_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(topic.0)
-    .bind(OffsetDateTime::now_utc())
-    .execute(&mut *connection)
-    .await?;
+    let affected = sqlx::query(include_str!("../sql/repository/retire_topic_states.sql"))
+        .bind(topic.0)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&mut *connection)
+        .await?;
 
     if affected.rows_affected() == 0 {
         return Ok(false);
@@ -1151,24 +882,9 @@ pub async fn repair_current_state_pointers(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<u64> {
-    let repaired = sqlx::query(
-        "UPDATE topics t
-            SET current_state_id = latest.id,
-                current_version  = latest.version
-           FROM (
-               SELECT topics.id AS topic_id, live.id, live.version
-               FROM topics
-               LEFT JOIN LATERAL (
-                   SELECT id, version FROM topic_states
-                   WHERE topic_id = topics.id AND deleted_at IS NULL
-                   ORDER BY version DESC LIMIT 1
-               ) AS live ON TRUE
-               WHERE topics.project_id = $1
-           ) AS latest
-          WHERE latest.topic_id = t.id
-            AND (t.current_state_id, t.current_version)
-                IS DISTINCT FROM (latest.id, latest.version)",
-    )
+    let repaired = sqlx::query(include_str!(
+        "../sql/repository/repair_current_state_pointers.sql"
+    ))
     .bind(project.0)
     .execute(executor)
     .await?;
@@ -1182,12 +898,11 @@ pub async fn source_at(
     project: ProjectId,
     locator: &str,
 ) -> Result<bool> {
-    let found: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM sources WHERE project_id = $1 AND locator = $2")
-            .bind(project.0)
-            .bind(locator)
-            .fetch_optional(executor)
-            .await?;
+    let found: Option<(i32,)> = sqlx::query_as(include_str!("../sql/repository/source_at.sql"))
+        .bind(project.0)
+        .bind(locator)
+        .fetch_optional(executor)
+        .await?;
     Ok(found.is_some())
 }
 
@@ -1200,16 +915,12 @@ pub async fn latest_hash_at(
     project: ProjectId,
     locator: &str,
 ) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT sv.content_hash FROM sources s
-           JOIN source_versions sv ON sv.project_id = s.project_id AND sv.source_id = s.id
-         WHERE s.project_id = $1 AND s.locator = $2
-         ORDER BY sv.version DESC LIMIT 1",
-    )
-    .bind(project.0)
-    .bind(locator)
-    .fetch_optional(executor)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as(include_str!("../sql/repository/latest_hash_at.sql"))
+            .bind(project.0)
+            .bind(locator)
+            .fetch_optional(executor)
+            .await?;
 
     Ok(row.map(|(hash,)| hash))
 }
@@ -1226,16 +937,11 @@ pub async fn latest_source_version(
     project: ProjectId,
     source: SourceId,
 ) -> Result<Option<SourceVersion>> {
-    let row = sqlx::query(
-        "SELECT id, project_id, source_id, version, content, content_hash,
-                filter_decision, filter_reason, recorded_at
-         FROM source_versions WHERE project_id = $1 AND source_id = $2
-         ORDER BY version DESC LIMIT 1",
-    )
-    .bind(project.0)
-    .bind(source.0)
-    .fetch_optional(executor)
-    .await?;
+    let row = sqlx::query(include_str!("../sql/repository/latest_source_version.sql"))
+        .bind(project.0)
+        .bind(source.0)
+        .fetch_optional(executor)
+        .await?;
 
     Ok(row.map(|row| SourceVersion {
         id: row.get::<uuid::Uuid, _>("id").into(),
@@ -1286,37 +992,12 @@ pub async fn grep_evidence(
     // Folding case in SQL keeps the match and the offset consistent: computing
     // one here and the other in Rust would drift on any multi-byte casing rule.
     //
-    // Two whole statements rather than one assembled around the comparison. The
-    // driver takes a statement that is `'static` or explicitly asserted safe,
-    // which is a deliberate obstacle in front of building SQL with `format!`,
-    // and the way past it that keeps the guarantee is to write both out.
-    // The match is computed once, in a lateral, and both selected and filtered
-    // from there. Written twice it read as one expression and was two, on the
-    // column holding every byte ever written.
-    macro_rules! grep {
-        ($matched:literal) => {
-            concat!(
-                "SELECT v.id, v.project_id, v.source_id, v.version, v.content, v.content_hash,
-                        v.filter_decision, v.filter_reason, v.recorded_at,
-                        s.locator, m.match_position
-                 FROM source_versions v
-                 JOIN sources s ON s.id = v.source_id
-                 CROSS JOIN LATERAL (SELECT ",
-                $matched,
-                " AS match_position) m
-                 WHERE v.project_id = $1 AND m.match_position > 0
-                 ORDER BY v.recorded_at DESC, v.id
-                 LIMIT $3"
-            )
-        };
-    }
-
+    // Compute the match once so selection and filtering share the same offset.
     let sql = if case_sensitive {
-        grep!("position($2 IN v.content)")
+        include_str!("../sql/repository/grep_evidence_case_sensitive.sql")
     } else {
-        grep!("position(lower($2) IN lower(v.content))")
+        include_str!("../sql/repository/grep_evidence_case_insensitive.sql")
     };
-
     let rows = sqlx::query(sql)
         .bind(project.0)
         .bind(needle)
@@ -1397,20 +1078,13 @@ pub async fn record_topic_names(
         .map(|(_, _, tokens)| i16::try_from(*tokens).unwrap_or(i16::MAX))
         .collect();
 
-    sqlx::query(
-        "INSERT INTO topic_name_tokens (project_id, topic_id, name_key, token_count)
-         SELECT $1, topic_id, name_key, token_count
-           FROM unnest($2::uuid[], $3::text[], $4::smallint[])
-             AS incoming(topic_id, name_key, token_count)
-         ON CONFLICT (project_id, topic_id) DO UPDATE
-             SET name_key = EXCLUDED.name_key, token_count = EXCLUDED.token_count",
-    )
-    .bind(project.0)
-    .bind(&topics)
-    .bind(&keys)
-    .bind(&counts)
-    .execute(executor)
-    .await?;
+    sqlx::query(include_str!("../sql/repository/record_topic_names.sql"))
+        .bind(project.0)
+        .bind(&topics)
+        .bind(&keys)
+        .bind(&counts)
+        .execute(executor)
+        .await?;
 
     Ok(())
 }
@@ -1422,7 +1096,7 @@ pub async fn record_topic_names(
 /// topics, which means there is nothing to ask about at all.
 pub async fn widest_topic_name(executor: impl PgExecutor<'_>, project: ProjectId) -> Result<usize> {
     let row: (Option<i16>,) =
-        sqlx::query_as("SELECT MAX(token_count) FROM topic_name_tokens WHERE project_id = $1")
+        sqlx::query_as(include_str!("../sql/repository/widest_topic_name.sql"))
             .bind(project.0)
             .fetch_one(executor)
             .await?;
@@ -1462,14 +1136,11 @@ pub async fn names_matching(
         return Ok(Vec::new());
     }
 
-    let rows = sqlx::query(
-        "SELECT name_key, topic_id FROM topic_name_tokens
-         WHERE project_id = $1 AND name_key = ANY($2)",
-    )
-    .bind(project.0)
-    .bind(runs)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/names_matching.sql"))
+        .bind(project.0)
+        .bind(runs)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -1496,22 +1167,10 @@ pub async fn topics_to_name(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<Vec<Topic>> {
-    let rows = sqlx::query(
-        "SELECT t.id, t.name, t.path, t.created_at FROM topics t
-         WHERE t.project_id = $1
-           AND (NOT EXISTS (
-                    SELECT 1 FROM sources s
-                     WHERE s.project_id = t.project_id
-                       AND s.locator = 'file:' || t.name)
-                OR EXISTS (
-                    SELECT 1 FROM sources s
-                     WHERE s.project_id = t.project_id
-                       AND s.locator = 'manual:' || t.name))
-         ORDER BY t.name ASC",
-    )
-    .bind(project.0)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/topics_to_name.sql"))
+        .bind(project.0)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -1545,14 +1204,11 @@ pub async fn file_topic_names(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<Vec<FileTopic>> {
-    let rows: Vec<(String, uuid::Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT t.name, t.current_state_id, s.root FROM sources s
-           JOIN topics t ON t.project_id = s.project_id AND t.name = substr(s.locator, 6)
-         WHERE s.project_id = $1 AND s.kind = 'file' AND t.current_state_id IS NOT NULL",
-    )
-    .bind(project.0)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(String, uuid::Uuid, Option<String>)> =
+        sqlx::query_as(include_str!("../sql/repository/file_topic_names.sql"))
+            .bind(project.0)
+            .fetch_all(executor)
+            .await?;
 
     Ok(rows
         .into_iter()
@@ -1591,20 +1247,13 @@ pub async fn file_topics_under(
             (low, high)
         })
         .unzip();
-    let rows: Vec<(String, uuid::Uuid, Option<String>)> = sqlx::query_as(
-        r#"SELECT DISTINCT t.name, t.current_state_id, s.root
-             FROM unnest($2::text[], $3::text[]) AS r (low, high)
-             JOIN sources s
-               ON s.project_id = $1 AND s.kind = 'file'
-              AND (s.locator COLLATE "C") >= r.low AND (s.locator COLLATE "C") < r.high
-             JOIN topics t ON t.project_id = s.project_id AND t.name = substr(s.locator, 6)
-            WHERE t.current_state_id IS NOT NULL"#,
-    )
-    .bind(project.0)
-    .bind(&low)
-    .bind(&high)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(String, uuid::Uuid, Option<String>)> =
+        sqlx::query_as(include_str!("../sql/repository/file_topics_under.sql"))
+            .bind(project.0)
+            .bind(&low)
+            .bind(&high)
+            .fetch_all(executor)
+            .await?;
 
     Ok(rows
         .into_iter()
@@ -1627,14 +1276,12 @@ pub async fn file_roots_of(
         return Ok(Vec::new());
     }
     let locators: Vec<String> = topics.iter().map(|topic| format!("file:{topic}")).collect();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT substr(locator, 6), root FROM sources
-          WHERE project_id = $1 AND locator = ANY($2) AND root IS NOT NULL",
-    )
-    .bind(project.0)
-    .bind(&locators)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(include_str!("../sql/repository/file_roots_of.sql"))
+            .bind(project.0)
+            .bind(&locators)
+            .fetch_all(executor)
+            .await?;
     Ok(rows)
 }
 
@@ -1663,17 +1310,12 @@ pub async fn file_records_of(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(
-        "SELECT f.root, f.file, f.size, f.modified_ns, f.changed_ns, f.inode, f.read_ns,
-                f.content_hash, f.sections, f.build
-           FROM unnest($2::text[], $3::text[]) AS k (root, file)
-           JOIN file_records f ON f.project_id = $1 AND f.root = k.root AND f.file = k.file",
-    )
-    .bind(project.0)
-    .bind(roots)
-    .bind(files)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/file_records_of.sql"))
+        .bind(project.0)
+        .bind(roots)
+        .bind(files)
+        .fetch_all(executor)
+        .await?;
     Ok(rows.iter().map(file_record).collect())
 }
 
@@ -1685,17 +1327,12 @@ pub async fn file_records_under(
     root: &str,
     prefix: &str,
 ) -> Result<Vec<FileRecord>> {
-    let rows = sqlx::query(
-        "SELECT root, file, size, modified_ns, changed_ns, inode, read_ns, content_hash, sections,
-                build
-           FROM file_records
-          WHERE project_id = $1 AND root = $2 AND starts_with(file, $3)",
-    )
-    .bind(project.0)
-    .bind(root)
-    .bind(prefix)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/file_records_under.sql"))
+        .bind(project.0)
+        .bind(root)
+        .bind(prefix)
+        .fetch_all(executor)
+        .await?;
     Ok(rows.iter().map(file_record).collect())
 }
 
@@ -1733,32 +1370,20 @@ pub async fn put_file_records(
         .iter()
         .map(|r| i32::try_from(r.sections).unwrap_or(i32::MAX))
         .collect();
-    sqlx::query(
-        "INSERT INTO file_records AS f
-                (project_id, root, file, size, modified_ns, changed_ns, inode, read_ns,
-                 content_hash, sections, build)
-         SELECT $1, * FROM unnest($2::text[], $3::text[], $4::bigint[], $5::bigint[],
-                                  $6::bigint[], $7::bigint[], $8::bigint[], $9::text[],
-                                  $10::int[], $11::text[])
-         ON CONFLICT (project_id, root, file) DO UPDATE
-            SET size = excluded.size, modified_ns = excluded.modified_ns,
-                changed_ns = excluded.changed_ns, inode = excluded.inode,
-                read_ns = excluded.read_ns, content_hash = excluded.content_hash,
-                sections = excluded.sections, build = excluded.build",
-    )
-    .bind(project.0)
-    .bind(&roots)
-    .bind(&files)
-    .bind(column(|r| r.size as i64))
-    .bind(column(|r| r.modified_ns))
-    .bind(column(|r| r.changed_ns))
-    .bind(column(|r| r.inode as i64))
-    .bind(column(|r| r.read_ns))
-    .bind(&hashes)
-    .bind(&sections)
-    .bind(&builds)
-    .execute(executor)
-    .await?;
+    sqlx::query(include_str!("../sql/repository/put_file_records.sql"))
+        .bind(project.0)
+        .bind(&roots)
+        .bind(&files)
+        .bind(column(|r| r.size as i64))
+        .bind(column(|r| r.modified_ns))
+        .bind(column(|r| r.changed_ns))
+        .bind(column(|r| r.inode as i64))
+        .bind(column(|r| r.read_ns))
+        .bind(&hashes)
+        .bind(&sections)
+        .bind(&builds)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
@@ -1772,16 +1397,12 @@ pub async fn forget_file_records(
     if files.is_empty() {
         return Ok(());
     }
-    sqlx::query(
-        "DELETE FROM file_records f
-          USING unnest($2::text[], $3::text[]) AS k (root, file)
-          WHERE f.project_id = $1 AND f.root = k.root AND f.file = k.file",
-    )
-    .bind(project.0)
-    .bind(roots)
-    .bind(files)
-    .execute(executor)
-    .await?;
+    sqlx::query(include_str!("../sql/repository/forget_file_records.sql"))
+        .bind(project.0)
+        .bind(roots)
+        .bind(files)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
@@ -1796,11 +1417,13 @@ pub async fn forget_records_of_files(
     if files.is_empty() {
         return Ok(());
     }
-    sqlx::query("DELETE FROM file_records WHERE project_id = $1 AND file = ANY($2)")
-        .bind(project.0)
-        .bind(files)
-        .execute(executor)
-        .await?;
+    sqlx::query(include_str!(
+        "../sql/repository/forget_records_of_files.sql"
+    ))
+    .bind(project.0)
+    .bind(files)
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -1819,14 +1442,9 @@ pub async fn forget_file_records_written_since(
     if topics.is_empty() {
         return Ok(());
     }
-    sqlx::query(
-        "DELETE FROM file_records f
-          USING unnest($2::text[], $3::text[], $4::text[]) AS k (root, file, topic)
-           JOIN sources s ON s.project_id = $1 AND s.locator = 'manual:' || k.topic
-           JOIN source_versions v
-             ON v.project_id = $1 AND v.source_id = s.id AND v.recorded_at >= $5
-          WHERE f.project_id = $1 AND f.root = k.root AND f.file = k.file",
-    )
+    sqlx::query(include_str!(
+        "../sql/repository/forget_file_records_written_since.sql"
+    ))
     .bind(project.0)
     .bind(roots)
     .bind(files)
@@ -1847,13 +1465,9 @@ pub async fn count_file_topics_under(
 ) -> Result<i64> {
     let low = format!("file:{prefix}");
     let high = format!("{low}{}", char::MAX);
-    let (count,): (i64,) = sqlx::query_as(
-        r#"SELECT count(*) FROM sources s
-             JOIN topics t ON t.project_id = s.project_id AND t.name = substr(s.locator, 6)
-            WHERE s.project_id = $1 AND s.kind = 'file'
-              AND (s.locator COLLATE "C") >= $2 AND (s.locator COLLATE "C") < $3
-              AND t.current_state_id IS NOT NULL"#,
-    )
+    let (count,): (i64,) = sqlx::query_as(include_str!(
+        "../sql/repository/count_file_topics_under.sql"
+    ))
     .bind(project.0)
     .bind(&low)
     .bind(&high)
@@ -1873,18 +1487,11 @@ pub async fn forget_file_record_of(
     project: ProjectId,
     topic: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "DELETE FROM file_records f
-          USING sources s
-          WHERE s.project_id = $1 AND s.locator = 'file:' || $2
-            AND f.project_id = $1 AND f.root = s.root
-            AND ($2 = f.file OR starts_with($2, f.file || ' › ')
-                 OR starts_with($2, f.file || ' #'))",
-    )
-    .bind(project.0)
-    .bind(topic)
-    .execute(executor)
-    .await?;
+    sqlx::query(include_str!("../sql/repository/forget_file_record_of.sql"))
+        .bind(project.0)
+        .bind(topic)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
@@ -1913,17 +1520,14 @@ pub async fn span_vectors(
         return Ok(Vec::new());
     }
     let hashes: Vec<&[u8]> = passage_hashes.iter().map(|hash| hash.as_slice()).collect();
-    let rows: Vec<(Vec<u8>, String, Vec<u8>)> = sqlx::query_as(
-        "SELECT passage_hash, encoding, vector FROM span_vectors
-          WHERE project_id = $1 AND revision = $2 AND passage_hash = ANY($3)
-            AND ($4::text IS NULL OR encoding = $4)",
-    )
-    .bind(project.0)
-    .bind(revision)
-    .bind(&hashes)
-    .bind(encoding)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(Vec<u8>, String, Vec<u8>)> =
+        sqlx::query_as(include_str!("../sql/repository/span_vectors.sql"))
+            .bind(project.0)
+            .bind(revision)
+            .bind(&hashes)
+            .bind(encoding)
+            .fetch_all(executor)
+            .await?;
     Ok(rows
         .into_iter()
         .map(|(hash, encoding, vector)| SpanVector {
@@ -1965,21 +1569,14 @@ pub async fn put_span_vectors<'a>(
     rows.dedup_by_key(|(hash, _)| *hash);
     for batch in rows.chunks(PUT_SPAN_VECTORS_BATCH) {
         let (hashes, vectors): (Vec<&[u8]>, Vec<&[u8]>) = batch.iter().copied().unzip();
-        sqlx::query(
-            "INSERT INTO span_vectors (project_id, revision, passage_hash, encoding, vector)
-             SELECT $1, $2, passage_hash, $3, vector FROM unnest($4::bytea[], $5::bytea[])
-                    AS v (passage_hash, vector)
-             ON CONFLICT (project_id, revision, passage_hash, encoding) DO UPDATE
-                SET vector = EXCLUDED.vector
-              WHERE octet_length(span_vectors.vector) <> octet_length(EXCLUDED.vector)",
-        )
-        .bind(project.0)
-        .bind(revision)
-        .bind(encoding)
-        .bind(hashes)
-        .bind(vectors)
-        .execute(&mut *connection)
-        .await?;
+        sqlx::query(include_str!("../sql/repository/put_span_vectors.sql"))
+            .bind(project.0)
+            .bind(revision)
+            .bind(encoding)
+            .bind(hashes)
+            .bind(vectors)
+            .execute(&mut *connection)
+            .await?;
     }
     Ok(())
 }
@@ -2004,16 +1601,12 @@ pub async fn sync_paths(
     if paths.is_empty() {
         return Ok(());
     }
-    sqlx::query(
-        "INSERT INTO synced_paths (project_id, path, vector_index, added_at)
-         SELECT $1, path, $3, now() FROM unnest($2::text[]) AS path
-         ON CONFLICT (project_id, path) DO UPDATE SET vector_index = excluded.vector_index",
-    )
-    .bind(project.0)
-    .bind(paths)
-    .bind(vector_index)
-    .execute(executor)
-    .await?;
+    sqlx::query(include_str!("../sql/repository/sync_paths.sql"))
+        .bind(project.0)
+        .bind(paths)
+        .bind(vector_index)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
@@ -2026,13 +1619,12 @@ pub async fn unsync_paths(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let removed: Vec<(String,)> = sqlx::query_as(
-        "DELETE FROM synced_paths WHERE project_id = $1 AND path = ANY($2) RETURNING path",
-    )
-    .bind(project.0)
-    .bind(paths)
-    .fetch_all(executor)
-    .await?;
+    let removed: Vec<(String,)> =
+        sqlx::query_as(include_str!("../sql/repository/unsync_paths.sql"))
+            .bind(project.0)
+            .bind(paths)
+            .fetch_all(executor)
+            .await?;
     Ok(removed.into_iter().map(|(path,)| path).collect())
 }
 
@@ -2041,15 +1633,11 @@ pub async fn synced_paths_of(
     executor: impl PgExecutor<'_>,
     project: ProjectId,
 ) -> Result<Vec<SyncedPath>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT p.name, s.path, s.vector_index
-           FROM synced_paths s JOIN projects p ON p.id = s.project_id
-          WHERE s.project_id = $1
-          ORDER BY s.path",
-    )
-    .bind(project.0)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as(include_str!("../sql/repository/synced_paths_of.sql"))
+            .bind(project.0)
+            .fetch_all(executor)
+            .await?;
     Ok(rows
         .into_iter()
         .map(|(project, path, vector_index)| SyncedPath {
@@ -2062,13 +1650,10 @@ pub async fn synced_paths_of(
 
 /// Every path kept in sync, in every project, by project and path.
 pub async fn synced_paths(executor: impl PgExecutor<'_>) -> Result<Vec<SyncedPath>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT p.name, s.path, s.vector_index
-           FROM synced_paths s JOIN projects p ON p.id = s.project_id
-          ORDER BY p.name, s.path",
-    )
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as(include_str!("../sql/repository/synced_paths.sql"))
+            .fetch_all(executor)
+            .await?;
     Ok(rows
         .into_iter()
         .map(|(project, path, vector_index)| SyncedPath {
@@ -2102,18 +1687,11 @@ pub async fn current_named(
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(concat!(
-        "SELECT t.name, t.id, ts.id AS state_id, sp.byte_start, sp.byte_end,
-                sv.content AS evidence
-           FROM topics t
-           JOIN topic_states ts ON ts.id = t.current_state_id",
-        span_joins!(),
-        " WHERE t.project_id = $1 AND t.name = ANY($2)"
-    ))
-    .bind(project.0)
-    .bind(names)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/current_named.sql"))
+        .bind(project.0)
+        .bind(names)
+        .fetch_all(executor)
+        .await?;
     Ok(rows
         .iter()
         .map(|row| Named {
@@ -2139,12 +1717,9 @@ pub async fn rename_topic(
     (from, to): (&str, &str),
     (from_locator, to_locator): (&str, &str),
 ) -> Result<bool> {
-    let taken: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM topics WHERE project_id = $1 AND name = $2
-         UNION ALL
-         SELECT 1 FROM sources WHERE project_id = $1 AND locator = $3
-         LIMIT 1",
-    )
+    let taken: Option<(i32,)> = sqlx::query_as(include_str!(
+        "../sql/repository/topic_name_or_locator_taken.sql"
+    ))
     .bind(project.0)
     .bind(to)
     .bind(to_locator)
@@ -2153,32 +1728,26 @@ pub async fn rename_topic(
     if taken.is_some() {
         return Ok(false);
     }
-    sqlx::query("UPDATE topics SET name = $2 WHERE id = $1")
+    sqlx::query(include_str!("../sql/repository/rename_topic.sql"))
         .bind(topic.0)
         .bind(to)
         .execute(&mut *connection)
         .await?;
-    sqlx::query("UPDATE sources SET locator = $3 WHERE project_id = $1 AND locator = $2")
+    sqlx::query(include_str!("../sql/repository/rename_source_locator.sql"))
         .bind(project.0)
         .bind(from_locator)
         .bind(to_locator)
         .execute(&mut *connection)
         .await?;
     // The new name is a topic's own now, and the old one is this topic's.
-    sqlx::query(
-        "WITH gone AS (DELETE FROM topic_aliases WHERE project_id = $1 AND name = $3)
-         INSERT INTO topic_aliases (project_id, name, topic_id, renamed_at)
-         VALUES ($1, $2, $4, $5)
-         ON CONFLICT (project_id, name)
-         DO UPDATE SET topic_id = EXCLUDED.topic_id, renamed_at = EXCLUDED.renamed_at",
-    )
-    .bind(project.0)
-    .bind(from)
-    .bind(to)
-    .bind(topic.0)
-    .bind(OffsetDateTime::now_utc())
-    .execute(&mut *connection)
-    .await?;
+    sqlx::query(include_str!("../sql/repository/move_topic_alias.sql"))
+        .bind(project.0)
+        .bind(from)
+        .bind(to)
+        .bind(topic.0)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&mut *connection)
+        .await?;
     crate::jobs::enqueue_all(
         &mut *connection,
         project,
@@ -2201,15 +1770,12 @@ pub async fn set_roots_at(
     if locators.is_empty() {
         return Ok(());
     }
-    sqlx::query(
-        "UPDATE sources SET root = $3
-         WHERE project_id = $1 AND locator = ANY($2) AND root IS DISTINCT FROM $3",
-    )
-    .bind(project.0)
-    .bind(locators)
-    .bind(root)
-    .execute(executor)
-    .await?;
+    sqlx::query(include_str!("../sql/repository/set_roots_at.sql"))
+        .bind(project.0)
+        .bind(locators)
+        .bind(root)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
@@ -2219,7 +1785,7 @@ pub async fn set_source_root(
     source: SourceId,
     root: &str,
 ) -> Result<()> {
-    sqlx::query("UPDATE sources SET root = $2 WHERE id = $1 AND root IS DISTINCT FROM $2")
+    sqlx::query(include_str!("../sql/repository/set_source_root.sql"))
         .bind(source.0)
         .bind(root)
         .execute(executor)
@@ -2232,13 +1798,10 @@ pub async fn set_source_root(
 /// Used to derive relationships from one topic's content naming another, which
 /// needs the whole set rather than a candidate list: any topic may be named.
 pub async fn all_topics(executor: impl PgExecutor<'_>, project: ProjectId) -> Result<Vec<Topic>> {
-    let rows = sqlx::query(
-        "SELECT id, name, path, created_at FROM topics
-         WHERE project_id = $1 ORDER BY name ASC",
-    )
-    .bind(project.0)
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/all_topics.sql"))
+        .bind(project.0)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -2262,14 +1825,11 @@ pub async fn recent_topics(
     project: ProjectId,
     limit: u32,
 ) -> Result<Vec<Topic>> {
-    let rows = sqlx::query(
-        "SELECT id, name, path, created_at FROM topics
-         WHERE project_id = $1 ORDER BY created_at DESC LIMIT $2",
-    )
-    .bind(project.0)
-    .bind(i64::from(limit))
-    .fetch_all(executor)
-    .await?;
+    let rows = sqlx::query(include_str!("../sql/repository/recent_topics.sql"))
+        .bind(project.0)
+        .bind(i64::from(limit))
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows
         .iter()
@@ -2289,7 +1849,7 @@ pub async fn recent_topics(
 /// hold once it has caught up -- which is what the index needs to size its
 /// segments before it is opened.
 pub async fn topic_count(executor: impl PgExecutor<'_>, project: ProjectId) -> Result<u64> {
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM topics WHERE project_id = $1")
+    let count: i64 = sqlx::query_scalar(include_str!("../sql/repository/topic_count.sql"))
         .bind(project.0)
         .fetch_one(executor)
         .await?;
@@ -2298,16 +1858,7 @@ pub async fn topic_count(executor: impl PgExecutor<'_>, project: ProjectId) -> R
 
 // A topic by its name, or by a name it went by before a rename when no topic
 // holds that name now: the topic's own row, read under its current name.
-const FIND_TOPIC: &str = "SELECT id, name, path, created_at FROM topics
-                          WHERE project_id = $1 AND name = $2
-                          UNION ALL
-                          SELECT t.id, t.name, t.path, t.created_at
-                            FROM topic_aliases a JOIN topics t ON t.id = a.topic_id
-                           WHERE a.project_id = $1 AND a.name = $2
-                             AND NOT EXISTS (
-                                 SELECT 1 FROM topics WHERE project_id = $1 AND name = $2
-                             )
-                          LIMIT 1";
+const FIND_TOPIC: &str = include_str!("../sql/repository/find_topic.sql");
 
 /// Looks up a topic by name within a project, or by a name it was renamed
 /// from that no topic holds now; the topic comes back under its current name.

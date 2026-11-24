@@ -4,6 +4,7 @@ The crates of pamin-memory, one Cargo workspace. The repository's
 `AGENTS.md` applies too; this file adds what is particular to Rust code.
 
 You must follow `../.agents/skills/pamin-engineering/references/rust.md`: @../.agents/skills/pamin-engineering/references/rust.md
+You must follow `../.agents/skills/pamin-engineering/references/data.md`: @../.agents/skills/pamin-engineering/references/data.md
 You must follow `../.agents/skills/pamin-engineering/references/performance.md`: @../.agents/skills/pamin-engineering/references/performance.md
 
 ## Stack
@@ -69,7 +70,7 @@ Where pamin-memory differs from a rule above, or has not built it yet:
 - **API documents:** the operations' types are `memory-contract`'s; there is no API document beyond the MCP tools' schemas that `pamin-kit` builds from them.
 - **Isolated APIs:** one API, the operation contract, served on the local socket and as MCP; no operator API.
 - **Transactions and charged writes:** the store is the authority and its cascade outbox records, in the write's transaction, what the index must still catch up on; nothing here charges, so no write takes a client id.
-- **Queries and migrations:** migrations in `crates/store/migrations/` are written by hand, numbered and append-only, and `migrations_stay_within_the_portable_sql_subset` checks them; the check for locking and destructive changes is not yet written; on the roadmap. `Database`'s project transaction still builds its `SET LOCAL` statement with `format!`.
+- **Queries and migrations:** store statements live in `crates/store/sql/`. Migrations in `crates/store/migrations/` are written by hand, numbered and append-only, and `migrations_stay_within_the_portable_sql_subset` checks them. The check for locking and destructive changes is not yet written and is on the roadmap. `Database::scoped` is the one place SQL is assembled in code. It substitutes a typed project UUID into the `begin_with` batch to start and scope the transaction in one round trip. A bound `set_config` would add a round trip.
 - **Settings:** settings are resolved once by `memory_client::settings` (flags over `config.toml` over defaults, with the `PAMIN_MEMORY_*` variables) and handed to the engine by `crates/cli/src/settings.rs`; there is no `.env.example`, product settings table, kill switch or operator API: those have no subject in a local tool.
 - **Calls and models:** the engine's own inference (embedding and reranking) goes only through `memory-index`, on `pamin-runtime`; there is no external service on a request's path. Metering and cost alerts belong to whoever hosts memory, not to this repository.
 - **Stubs and logs:** the test databases come from `postgresql_embedded`; logs go through `tracing` with ids, counts and durations.
