@@ -303,11 +303,7 @@ impl Database {
         // no binds. UUID display only emits hex digits and hyphens.
         let mut uuid_buffer = uuid::Uuid::encode_buffer();
         let project = project.0.as_hyphenated().encode_lower(&mut uuid_buffer);
-        let begin = include_str!("../sql/database/begin_scoped_transaction.sql").replacen(
-            "__PROJECT_ID__",
-            project,
-            1,
-        );
+        let begin = SCOPED_TRANSACTION_SQL.replacen(SCOPED_PROJECT_PLACEHOLDER, project, 1);
         Ok(self.pool.begin_with(sqlx::AssertSqlSafe(begin)).await?)
     }
 }
@@ -335,6 +331,8 @@ impl Database {
 
 /// The role a [`Database::scoped`] transaction runs as.
 const APP_ROLE: &str = "pamin_memory_app";
+const SCOPED_TRANSACTION_SQL: &str = include_str!("../sql/database/begin_scoped_transaction.sql");
+const SCOPED_PROJECT_PLACEHOLDER: &str = "__PROJECT_ID__";
 
 /// What a cluster started for `store` records it was started with.
 fn started_with(store: &StoreSettings) -> StartedWith {
@@ -820,7 +818,28 @@ const PROBE: Duration = Duration::from_secs(1);
 mod tests {
     use std::net::TcpListener;
 
-    use super::{StoreSettings, UNREAD, UNREAD_WITHOUT_JIT, stale_pid_file, trim_unread};
+    use super::{
+        APP_ROLE, SCOPED_PROJECT_PLACEHOLDER, SCOPED_TRANSACTION_SQL, StoreSettings, UNREAD,
+        UNREAD_WITHOUT_JIT, stale_pid_file, trim_unread,
+    };
+
+    #[test]
+    fn scoped_transaction_sets_the_app_role() {
+        let role = SCOPED_TRANSACTION_SQL
+            .split(';')
+            .find_map(|statement| statement.trim().strip_prefix("SET LOCAL ROLE "));
+        assert_eq!(role, Some(APP_ROLE));
+    }
+
+    #[test]
+    fn scoped_transaction_has_one_project_placeholder() {
+        assert_eq!(
+            SCOPED_TRANSACTION_SQL
+                .matches(SCOPED_PROJECT_PLACEHOLDER)
+                .count(),
+            1,
+        );
+    }
 
     /// A running cluster is reused only by a caller asking for the store
     /// settings it was started with; a changed `jit` or PostgreSQL prefix,

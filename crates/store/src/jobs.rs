@@ -495,6 +495,31 @@ mod tests {
 
     use super::priority;
 
+    #[test]
+    fn standalone_and_promoted_enqueue_reset_the_same_claim_fields() {
+        fn conflict_clause(sql: &str, timestamp_bind: &str) -> String {
+            let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let (_, clause) = sql
+                .split_once(" ON CONFLICT ")
+                .expect("enqueue must handle a conflict");
+            let clause = clause
+                .split_once(") SELECT ")
+                .map_or(clause, |(cte, _)| cte);
+            clause.trim().replace(
+                &format!("available_at = {timestamp_bind},"),
+                "available_at = <timestamp>,",
+            )
+        }
+
+        assert_eq!(
+            conflict_clause(include_str!("../sql/jobs/enqueue_jobs.sql"), "$3"),
+            conflict_clause(
+                include_str!("../sql/repository/insert_promoted_evidence.sql"),
+                "$8",
+            ),
+        );
+    }
+
     /// The priorities rows are queued with, which a claim reads back as a key.
     ///
     /// Pinned because a queued row keeps the number it was written with and a
