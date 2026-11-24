@@ -26,6 +26,11 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
+      # The skills CLI installs into every agent it knows when it detects none, Eve's
+      # agent/skills/ among them; a Claude Code home keeps it to the folders this
+      # repository tracks (.agents/skills/ and the .claude/skills/ links).
+      - name: Mark Claude Code as the agent
+        run: mkdir -p "$HOME/.claude"
       - name: Update project skills
         env:
           DISABLE_TELEMETRY: '1'
