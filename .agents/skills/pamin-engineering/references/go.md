@@ -47,6 +47,9 @@ Read this when writing or reviewing Go. It says how Go code meets `core.md`, `da
 
 - **Allocate once:** slices, maps and `strings.Builder`s are pre-sized from a known size (`make([]T, 0, n)`, `b.Grow(n)`).
 - **Static dispatch:** concrete types in hot loops; an interface only at a boundary crossed once per request or less.
+- **Profile-guided optimisation:** a service's `default.pgo` is collected from production or a representative load, committed beside `main`, and refreshed when the hot code changes; its effect is measured like any speed claim.
+- **Layout and escapes:** hot structs are ordered to cut padding, fields written by different goroutines are padded to separate cache lines, and a hot path's allocations are checked with `go build -gcflags=-m` and the benchmark's `-benchmem`.
+- **Benchmarks** use `b.Loop()` (or keep results alive with `runtime.KeepAlive`) so the compiler cannot drop the work, and are compared with `benchstat` over repeated runs.
 - **Bounded concurrency:** a channel is buffered to a size named once; a fan-out is capped with `errgroup.SetLimit`.
 - **Round trips:** keyset pagination (`id < $1 order by id desc limit n`) with indexes matching each query; independent reads batched (`pgx.Batch`) or folded into one statement.
 - **Paired keyset lists** in sqlc write their source, joins, filters and projection once, in `with filtered as not materialized (...)`; the forward and backward halves read from it and keep only the direction guard, cursor comparison, order and limit. PostgreSQL inlines a `not materialized` CTE into each half, so both still seek the index, and the plan test keeps checking that they do.

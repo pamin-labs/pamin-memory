@@ -48,3 +48,8 @@ Read this when writing or reviewing Rust. It says how Rust code meets `core.md`,
 
 - **Allocate once:** reuse buffers with `clear()`, size them with `with_capacity` from a known size; no `collect()` into a `Vec` only to iterate it once; no `to_string()` or `format!` for a value only compared or written out.
 - **Static dispatch** is generics or `impl Trait`; `dyn` only at boundaries crossed once per request or less.
+- **Names signal cost** as the API Guidelines say: `as_` is free and borrowed, `to_` costly, `into_` consumes; getters have no `get_` prefix; iterators are `iter`, `iter_mut`, `into_iter`.
+- **Assertions:** `debug_assert!` for invariants checked in development, `assert!` for those that must hold in release; neither checks what input can make false, which gets an error.
+- **Cold paths** that a hot function rarely takes go in a separate function marked `#[cold]` (with `#[inline(never)]` where it measures better); `#[inline]` is written across crates only where a measurement shows the call was not inlined.
+- **Layout:** elements of one collection refer to each other by newtype indices (`struct NodeId(u32)`), not `Rc` or pointers; a hot type's size is pinned with `const _: () = assert!(size_of::<T>() == N);`; fields written by different threads are wrapped in `crossbeam_utils::CachePadded`.
+- **Benchmarks** keep results alive with `std::hint::black_box`.
